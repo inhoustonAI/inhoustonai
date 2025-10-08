@@ -1,5 +1,5 @@
 # main_fastapi.py
-# Versión 2025-10-08 — Realtime con handshake estable y logs extendidos
+# Versión 2025-10-08 — Realtime estable (Twilio ↔ OpenAI) con soporte ["audio","text"] y control de buffer vacío
 
 import os
 import json
@@ -65,21 +65,24 @@ async def media_socket(websocket: WebSocket):
         ) as openai_ws:
             print("🔗 [OpenAI] Conectado correctamente")
 
-            # Enviar saludo inicial
+            # Enviar saludo inicial compatible con nuevos parámetros
             await openai_ws.send(json.dumps({
                 "type": "response.create",
                 "response": {
-                    "modalities": ["audio"],
+                    "modalities": ["audio", "text"],
                     "instructions": (
-                        "Habla en voz natural, en español, representando a In Houston Texas. "
-                        "Preséntate como asistente de servicios en Houston, Texas, "
-                        "y pregunta cómo puedes ayudar."
+                        "Habla con voz natural y tono cálido, en español latino. "
+                        "Preséntate como el asistente de servicios de In Houston Texas, "
+                        "ofrece información de negocios y ayuda para agendar citas."
                     )
                 }
             }))
 
+            buffer_has_audio = False  # para controlar commits vacíos
+
             async def twilio_to_openai():
                 """Twilio -> OpenAI"""
+                nonlocal buffer_has_audio
                 try:
                     while True:
                         msg_txt = await websocket.receive_text()
@@ -98,14 +101,19 @@ async def media_socket(websocket: WebSocket):
                                 "type": "input_audio_buffer.append",
                                 "audio": b64
                             }))
+                            buffer_has_audio = True
 
                         elif ev == "stop":
                             print("🛑 [Twilio] stream detenido — solicitando respuesta")
-                            await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                            await openai_ws.send(json.dumps({
-                                "type": "response.create",
-                                "response": {"modalities": ["audio"]}
-                            }))
+                            if buffer_has_audio:
+                                await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                                await openai_ws.send(json.dumps({
+                                    "type": "response.create",
+                                    "response": {"modalities": ["audio", "text"]}
+                                }))
+                            else:
+                                print("⚠️ [OpenAI] buffer vacío, omitiendo commit")
+                            buffer_has_audio = False
                             break
                 except Exception as e:
                     print(f"⚠️ [Twilio→OpenAI] Error: {e}")
