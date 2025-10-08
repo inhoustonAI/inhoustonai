@@ -44,12 +44,11 @@ async def twiml_webhook(_: Request):
     xml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://inhouston-ai-api.onrender.com/media">
-      <Parameter name="track" value="inbound_track"/>
-    </Stream>
+    <Stream url="wss://inhouston-ai-api.onrender.com/media" track="inbound_track"/>
   </Connect>
 </Response>"""
     return Response(content=xml.strip(), media_type="application/xml")
+
 
 
 # ==============================
@@ -230,4 +229,5 @@ async def media_socket(websocket: WebSocket):
 # ==============================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
