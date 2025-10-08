@@ -1,0 +1,16 @@
+# Entorno / caches
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Variables locales
+.env
+
+# VS Code
+.vscode/
+
+# Render/Build
+*.log
+.env
+.env
