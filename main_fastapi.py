@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # CONFIGURACIÓN GLOBAL
 # ==============================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+print(f"🧩 DEBUG — OPENAI_API_KEY cargada: {OPENAI_API_KEY[:10]}...")  # imprime solo el inicio para confirmar
 app = FastAPI(title="In Houston AI — Twilio Realtime Bridge")
 
 # CORS general
