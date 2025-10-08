@@ -40,7 +40,7 @@ async def twiml_webhook(_: Request):
 <Response>
   <Connect>
     <Stream url="wss://inhouston-ai-api.onrender.com/media"
-            track="inbound_track"
+            track="inbound_audio"
             audioFormat="audio/x-ulaw;rate=8000"/>
   </Connect>
 </Response>"""
