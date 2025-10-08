@@ -14,7 +14,7 @@ from starlette.websockets import WebSocketState
 
 # ===== CONFIGURACIÓN =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-PORT = int(os.getenv("PORT", 10000))
+PORT = int(os.getenv("PORT") or 8080)
 print(f"🧩 DEBUG OPENAI_API_KEY: {OPENAI_API_KEY[:10]}...")
 print(f"🧩 Using PORT: {PORT}")
 
