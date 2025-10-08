@@ -34,14 +34,14 @@ async def root():
 @app.post("/twiml")
 async def twiml_webhook(_: Request):
     xml = """<?xml version="1.0" encoding="UTF-8"?>
-<<Response>
-  <Connect>
-    <Stream url="wss://inhouston-ai-api.onrender.com/media">
-      <Parameter name="track" value="both_tracks"/>
-    </Stream>
-  </Connect>
+<Response>
+    <Connect>
+        <Stream url="wss://inhouston-ai-api.onrender.com/media">
+            <Parameter name="track" value="both_tracks"/>
+        </Stream>
+    </Connect>
 </Response>"""
-    return Response(content=xml, media_type="application/xml")
+    return Response(content=xml.strip(), media_type="application/xml")
 
 # ---------- Utilidades ----------
 async def send_twilio_media(ws: WebSocket, ulaw_b64: str):
