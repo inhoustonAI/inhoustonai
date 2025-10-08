@@ -1,5 +1,6 @@
 # main_fastapi.py
-# Versión 2025-10-08 — Twilio ↔ OpenAI Realtime ESTABLE con diagnóstico detallado
+# Versión 2025-10-08 — Twilio ↔ OpenAI Realtime ESTABLE
+# Maneja eventos nuevos: "response.audio.delta" y "response.audio_transcript.delta"
 
 import os
 import json
@@ -15,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # CONFIGURACIÓN GLOBAL
 # ==============================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-print(f"🧩 DEBUG — OPENAI_API_KEY cargada: {OPENAI_API_KEY[:10]}...")  # imprime solo el inicio
+print(f"🧩 DEBUG — OPENAI_API_KEY cargada: {OPENAI_API_KEY[:10]}...")
 
 app = FastAPI(title="In Houston AI — Twilio Realtime Bridge")
 
@@ -65,13 +66,12 @@ async def media_socket(websocket: WebSocket):
         await websocket.close()
         return
 
-    # URI del Realtime API
     realtime_uri = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
     oa_headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "OpenAI-Beta": "realtime=v1",
     }
-    subprotocols = ["realtime", "openai-realtime"]  # compatibles
+    subprotocols = ["realtime", "openai-realtime"]  # compatibles actuales
 
     print(f"🌐 Intentando conectar con OpenAI Realtime → {realtime_uri}")
     try:
@@ -86,7 +86,7 @@ async def media_socket(websocket: WebSocket):
         ) as openai_ws:
             print("🔗 [OpenAI] Realtime CONNECTED")
 
-            # ⚙️ Saludo / arranque (modalidades válidas)
+            # Saludo / arranque (modalidades válidas)
             await openai_ws.send(json.dumps({
                 "type": "response.create",
                 "response": {
@@ -139,29 +139,41 @@ async def media_socket(websocket: WebSocket):
                             else:
                                 print("⚠️ [OpenAI] buffer vacío, omitiendo commit")
                             buffer_has_audio = False
-                            # NO cerramos; Twilio puede reiniciar otro ciclo start/media/stop
+                            # No cerramos; Twilio puede reiniciar otro ciclo start/media/stop
                 except Exception as e:
                     print(f"⚠️ [Twilio→OpenAI] Error: {e}")
 
             # ---------- OpenAI -> Twilio ----------
             async def openai_to_twilio():
+                """
+                Reenvía el audio de OpenAI a Twilio.
+                OpenAI puede enviar:
+                  - "output_audio.delta" (formato anterior) con campo "audio"
+                  - "response.audio.delta"  (formato nuevo)    con campo "audio" o "delta"
+                """
                 try:
                     async for raw in openai_ws:
+                        # Algunos mensajes son binarios; si no es JSON, lo ignoramos
                         try:
                             evt = json.loads(raw)
                         except Exception:
-                            # Mensajes binarios u otros: ignorar
                             continue
 
                         evt_type = evt.get("type")
 
-                        # Log útil (sin inundar)
-                        if evt_type and evt_type not in ("output_audio.delta",):
+                        # Log informativo de otros eventos (sin inundar)
+                        if evt_type and evt_type not in ("output_audio.delta", "response.audio.delta"):
                             print(f"ℹ️ [OpenAI] {evt_type}")
 
-                        if evt_type == "output_audio.delta":
-                            # Audio PCM16 16k de OpenAI → μ-law 8k para Twilio
-                            pcm16 = base64.b64decode(evt.get("audio", ""))
+                        # Capturamos audio tanto del evento viejo como del nuevo
+                        if evt_type in ("output_audio.delta", "response.audio.delta"):
+                            # En distintas versiones el audio viene en "audio" o en "delta"
+                            audio_b64 = evt.get("audio") or evt.get("delta") or ""
+                            if not audio_b64:
+                                continue
+
+                            # OpenAI → PCM16 16k  → Twilio μ-law 8k
+                            pcm16 = base64.b64decode(audio_b64)
                             pcm8k, _ = audioop.ratecv(pcm16, 2, 1, 16000, 8000, None)
                             ulaw = audioop.lin2ulaw(pcm8k, 2)
                             payload = base64.b64encode(ulaw).decode("utf-8")
