@@ -1,6 +1,5 @@
 # main_fastapi.py
-# Versión FINAL — Bridge Twilio ↔ OpenAI Realtime (100% estable en Render)
-# Compatible con Twilio <Stream track="inbound_track"/> y OpenAI Realtime WS
+# Versión estable Twilio ↔ OpenAI Realtime (octubre 2025)
 
 import os
 import json
@@ -13,15 +12,15 @@ from fastapi.responses import Response, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 
-# ==========================================================
-# CONFIGURACIÓN GLOBAL
-# ==========================================================
+# ===== CONFIGURACIÓN =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+PORT = int(os.getenv("PORT", 10000))
 print(f"🧩 DEBUG OPENAI_API_KEY: {OPENAI_API_KEY[:10]}...")
+print(f"🧩 Using PORT: {PORT}")
 
 app = FastAPI(title="In Houston AI — Twilio Realtime Bridge")
 
-# CORS para Twilio
+# CORS (para Twilio)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,18 +29,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ==========================================================
-# ENDPOINT ROOT
-# ==========================================================
 @app.get("/")
 async def root():
     return PlainTextResponse("✅ In Houston AI — FastAPI listo para Twilio Realtime")
 
-
-# ==========================================================
-# TWIML (Twilio llama aquí cuando entra una llamada)
-# ==========================================================
+# ---------- Twilio Webhook ----------
 @app.post("/twiml")
 async def twiml_webhook(_: Request):
     xml = """<?xml version="1.0" encoding="UTF-8"?>
@@ -54,27 +46,21 @@ async def twiml_webhook(_: Request):
 </Response>"""
     return Response(content=xml.strip(), media_type="application/xml")
 
-# ==========================================================
-# FUNCIONES UTILITARIAS
-# ==========================================================
+# ---------- Utilidades ----------
 async def send_twilio_media(ws: WebSocket, ulaw_b64: str):
-    """Envía un frame μ-law a Twilio si el socket sigue abierto."""
+    """Envía frame μ-law a Twilio si el socket sigue abierto."""
     if ws.application_state == WebSocketState.CONNECTED:
         try:
             await ws.send_text(json.dumps({"event": "media", "media": {"payload": ulaw_b64}}))
         except Exception as e:
             print(f"⚠️ [Twilio] envío fallido: {e}")
 
-
 def ulaw_silence_frame_base64(ms: int = 20):
     """Frame de silencio μ-law 8k (20 ms)."""
     samples = 8_000 * ms // 1000
     return base64.b64encode(b"\xFF" * samples).decode("utf-8")
 
-
-# ==========================================================
-# SOCKET PRINCIPAL — Conecta Twilio ↔ OpenAI Realtime
-# ==========================================================
+# ---------- WebSocket /media ----------
 @app.websocket("/media")
 async def media_socket(websocket: WebSocket):
     await websocket.accept()
@@ -93,20 +79,20 @@ async def media_socket(websocket: WebSocket):
             realtime_uri,
             extra_headers=headers,
             subprotocols=["realtime"],
-            ping_interval=15,
-            ping_timeout=15,
+            ping_interval=20,
+            ping_timeout=20,
             close_timeout=5,
             max_size=10_000_000,
         ) as openai_ws:
             print("🔗 [OpenAI] Realtime CONNECTED")
 
-            # === Saludo inicial ===
+            # Saludo inicial
             await openai_ws.send(json.dumps({
                 "type": "response.create",
                 "response": {
                     "modalities": ["audio", "text"],
                     "instructions": (
-                        "Habla con voz natural y profesional, en español latino. "
+                        "Habla con voz natural y profesional en español latino. "
                         "Eres el asistente de In Houston Texas. "
                         "Saluda al inicio y pregunta cómo puedes ayudar."
                     ),
@@ -117,12 +103,12 @@ async def media_socket(websocket: WebSocket):
             buffer_has_audio = False
             stop_keepalive = False
 
-            # ---- Silencio periódico para mantener conexión activa ----
+            # ---- Silencio keepalive ----
             async def keepalive():
                 nonlocal stop_keepalive
                 try:
                     while not stop_keepalive and websocket.application_state == WebSocketState.CONNECTED:
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.1)
                         await send_twilio_media(websocket, ulaw_silence_frame_base64(20))
                 except asyncio.CancelledError:
                     pass
@@ -157,14 +143,16 @@ async def media_socket(websocket: WebSocket):
                                 await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                                 await openai_ws.send(json.dumps({
                                     "type": "response.create",
-                                    "response": {"modalities": ["audio", "text"], "voice": "alloy"}
+                                    "response": {
+                                        "modalities": ["audio", "text"],
+                                        "voice": "alloy"
+                                    }
                                 }))
                                 buffer_has_audio = False
                             else:
                                 print("⚠️ [OpenAI] buffer vacío, no se envía commit")
                             stop_keepalive = True
                             break
-
                 except Exception as e:
                     print(f"⚠️ [Twilio→OpenAI] Error: {e}")
                     stop_keepalive = True
@@ -174,13 +162,10 @@ async def media_socket(websocket: WebSocket):
                 nonlocal stop_keepalive
                 try:
                     async for raw in openai_ws:
-                        try:
-                            evt = json.loads(raw)
-                        except Exception:
-                            continue
-
+                        evt = json.loads(raw)
                         t = evt.get("type")
-                        if t not in ("response.audio.delta", "output_audio.delta"):
+
+                        if t and t not in ("response.audio.delta", "output_audio.delta"):
                             if t == "error":
                                 print(f"❌ [OpenAI] {evt.get('error')}")
                             else:
@@ -194,6 +179,7 @@ async def media_socket(websocket: WebSocket):
                             pcm8k, _ = audioop.ratecv(pcm16, 2, 1, 16000, 8000, None)
                             ulaw = audioop.lin2ulaw(pcm8k, 2)
                             await send_twilio_media(websocket, base64.b64encode(ulaw).decode("utf-8"))
+                            stop_keepalive = True
                 except Exception as e:
                     print(f"⚠️ [OpenAI→Twilio] Error: {e}")
                     stop_keepalive = True
@@ -211,10 +197,6 @@ async def media_socket(websocket: WebSocket):
     finally:
         print("🔴 [Twilio] WebSocket CLOSED")
 
-
-# ==========================================================
-# MAIN (ejecución local / Render)
-# ==========================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=PORT, reload=True)
