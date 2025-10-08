@@ -14,9 +14,12 @@ from starlette.websockets import WebSocketState
 
 # ===== CONFIGURACIÓN =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-PORT = int(os.getenv("PORT") or 8080)
-print(f"🧩 DEBUG OPENAI_API_KEY: {OPENAI_API_KEY[:10]}...")
+
+PORT_ENV = os.getenv("PORT")
+print(f"🧩 RAW PORT from Render: {PORT_ENV}")
+PORT = int(PORT_ENV) if PORT_ENV else 8080
 print(f"🧩 Using PORT: {PORT}")
+
 
 app = FastAPI(title="In Houston AI — Twilio Realtime Bridge")
 
