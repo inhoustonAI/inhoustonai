@@ -7,7 +7,7 @@
 
   "vad": {
     "type": "server_vad",
-    "silence_ms": 650,
+    "silence_ms": 1200,
     "prefix_ms": 60
   }
 }
