@@ -1,10 +1,10 @@
 # main_fastapi.py
 # Versión estable Twilio ↔ OpenAI Realtime (oct 2025)
-# - Sin conversiones de audio (μ-law 8k end-to-end)
-# - Turn detection (server_vad)
-# - Envío de streamSid a Twilio en los "media" de vuelta
-# - Respuestas creadas al detectar fin de habla
-# - Saludo inicial opcional
+# - μ-law 8 kHz end-to-end (sin resampling)
+# - Server VAD (turn_detection) en OpenAI
+# - Envío con temporización (20 ms) hacia Twilio para evitar audio entrecortado
+# - Reenvío de streamSid en los eventos "media" hacia Twilio
+# - Respuestas creadas automáticamente al detectar fin de habla (speech_stopped)
 
 import os
 import json
@@ -46,7 +46,6 @@ async def root():
 @app.post("/twiml")
 async def twiml_webhook(request: Request):
     host = request.url.hostname or "inhouston-ai-api.onrender.com"
-    # Twilio solo necesita el WS. No pongas Say para evitar 'doble voz'.
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -56,21 +55,7 @@ async def twiml_webhook(request: Request):
     return Response(content=xml.strip(), media_type="application/xml")
 
 # ===== Utilidades =====
-async def twilio_send_media(ws: WebSocket, ulaw_b64: str, stream_sid: str | None):
-    """Envía un frame μ-law a Twilio si el socket sigue abierto."""
-    if ws.application_state == WebSocketState.CONNECTED:
-        payload = {
-            "event": "media",
-            "media": {"payload": ulaw_b64},
-        }
-        if stream_sid:
-            payload["streamSid"] = stream_sid
-        try:
-            await ws.send_text(json.dumps(payload))
-        except Exception as e:
-            print(f"⚠️ [Twilio] envío fallido: {e}")
-
-def ulaw_silence_b64(ms: int = 20):
+def ulaw_silence_b64(ms: int = 20) -> str:
     """Frame de silencio μ-law 8k (20 ms). μ-law silencio = 0xFF."""
     samples = 8_000 * ms // 1000
     return base64.b64encode(b"\xFF" * samples).decode("utf-8")
@@ -93,7 +78,41 @@ async def media_socket(websocket: WebSocket):
     }
 
     stream_sid: str | None = None
-    stop_keepalive = False
+
+    # Cola de salida para Twilio (μ-law b64) y emisor ritmado (20 ms)
+    outbound_queue: asyncio.Queue[str] = asyncio.Queue()
+
+    async def _twilio_send_ulaw_b64(ulaw_b64: str):
+        """Envía un frame μ-law a Twilio (con streamSid si está disponible)."""
+        if websocket.application_state != WebSocketState.CONNECTED:
+            return
+        payload = {
+            "event": "media",
+            "media": {"payload": ulaw_b64},
+        }
+        if stream_sid:
+            payload["streamSid"] = stream_sid
+        try:
+            await websocket.send_text(json.dumps(payload))
+        except Exception as e:
+            print(f"⚠️ [Twilio] envío fallido: {e}")
+
+    async def paced_sender():
+        """
+        Consumidor de la cola de salida que envía a Twilio a ~20 ms por frame.
+        Si la cola se queda vacía por >60 ms, envía un silencio de 20 ms (keepalive).
+        """
+        SILENCE_20 = ulaw_silence_b64(20)
+        while websocket.application_state == WebSocketState.CONNECTED:
+            try:
+                # Espera un frame hasta 60 ms; si no hay, manda silencio
+                b64 = await asyncio.wait_for(outbound_queue.get(), timeout=0.06)
+                await _twilio_send_ulaw_b64(b64)
+                # Ritmo objetivo ~20 ms
+                await asyncio.sleep(0.02)
+            except asyncio.TimeoutError:
+                # Mantiene viva la llamada y el jitter buffer de Twilio estable
+                await _twilio_send_ulaw_b64(SILENCE_20)
 
     try:
         async with websockets.connect(
@@ -111,12 +130,9 @@ async def media_socket(websocket: WebSocket):
             session_update = {
                 "type": "session.update",
                 "session": {
-                    # Activa detección de turnos del lado servidor (no dependemos de 'stop' de Twilio)
                     "turn_detection": {"type": "server_vad"},
-                    # Formatos de audio de entrada/salida (μ-law 8k) para evitar resamplings
                     "input_audio_format": "g711_ulaw",
                     "output_audio_format": "g711_ulaw",
-                    # Voz y rol del asistente
                     "voice": VOICE,
                     "modalities": ["text", "audio"],
                     "instructions": (
@@ -133,17 +149,8 @@ async def media_socket(websocket: WebSocket):
             # (Opcional) Saludo inicial inmediato:
             await openai_ws.send(json.dumps({"type": "response.create"}))
 
-            # ---- Keepalive de silencio para evitar corte de Twilio por inactividad ----
-            async def keepalive():
-                nonlocal stop_keepalive
-                try:
-                    while not stop_keepalive and websocket.application_state == WebSocketState.CONNECTED:
-                        await asyncio.sleep(0.1)
-                        await twilio_send_media(websocket, ulaw_silence_b64(20), stream_sid)
-                except asyncio.CancelledError:
-                    pass
-
-            ka_task = asyncio.create_task(keepalive())
+            # Lanzamos el emisor ritmado hacia Twilio
+            sender_task = asyncio.create_task(paced_sender())
 
             # ---- Twilio -> OpenAI (μ-law directo) ----
             async def twilio_to_openai():
@@ -159,7 +166,7 @@ async def media_socket(websocket: WebSocket):
                             print(f"🎧 [Twilio] stream START sid={stream_sid}")
 
                         elif ev == "media":
-                            # Pasamos el payload μ-law TAL CUAL al Realtime (sin convertir)
+                            # μ-law base64 tal cual hacia OpenAI
                             ulaw_b64 = data["media"]["payload"]
                             await openai_ws.send(json.dumps({
                                 "type": "input_audio_buffer.append",
@@ -167,12 +174,11 @@ async def media_socket(websocket: WebSocket):
                             }))
 
                         elif ev == "mark":
-                            # Marca de Twilio para final de parte de audio reproducida
+                            # Marca de Twilio para fin de un bloque reproducido (opcional)
                             pass
 
                         elif ev == "stop":
                             print("🛑 [Twilio] stream STOP (fin de la llamada)")
-                            # Si Twilio cierra, cerramos del lado de OpenAI
                             try:
                                 await openai_ws.close()
                             except Exception:
@@ -202,24 +208,27 @@ async def media_socket(websocket: WebSocket):
                             await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                             await openai_ws.send(json.dumps({"type": "response.create"}))
 
-                        # Audio saliente (nombres de evento pueden variar por release)
+                        # Audio saliente (los nombres pueden variar por release)
                         if t in ("response.audio.delta", "response.output_audio.delta"):
                             # Campo puede ser 'delta' (nuevo) o 'audio' (algunas previews)
                             audio_b64 = evt.get("delta") or evt.get("audio")
                             if not audio_b64:
                                 continue
-                            # Reenvía μ-law directo a Twilio
-                            await twilio_send_media(websocket, audio_b64, stream_sid)
+                            # Encolamos el frame para que el sender lo pacee a 20 ms
+                            await outbound_queue.put(audio_b64)
 
                 except Exception as e:
                     print(f"⚠️ [OpenAI→Twilio] Error: {e}")
 
             await asyncio.gather(twilio_to_openai(), openai_to_twilio())
 
-            # Apagar keepalive si sigue corriendo
-            stop_keepalive = True
-            if not ka_task.done():
-                ka_task.cancel()
+            # Cerrar emisor ritmado
+            if not sender_task.done():
+                sender_task.cancel()
+                try:
+                    await sender_task
+                except asyncio.CancelledError:
+                    pass
 
     except Exception as e:
         import traceback
