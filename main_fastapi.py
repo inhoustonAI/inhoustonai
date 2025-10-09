@@ -1,23 +1,22 @@
 # main_fastapi.py
-# Versión multibot Twilio ↔ OpenAI Realtime (oct 2025)
+# Versión multibot Twilio ↔ OpenAI Realtime (oct 2025) — FIX formatos + modalidades
 # - μ-law 8 kHz end-to-end (sin resampling)
-# - VAD de servidor (turn_detection) en OpenAI (parametrizable por JSON)
-# - Ritmo 20 ms hacia Twilio para audio estable (keepalive si no hay cola)
-# - MATRIZ: saludo, instrucciones, voz, temperatura, modelo y VAD vienen del JSON en bots/<slug>.json
+# - VAD de servidor (turn_detection) en OpenAI
+# - Ritmo 20 ms hacia Twilio para audio estable
+# - MATRIZ: saludo, instrucciones, voz, temperatura, modelo y realtime vienen del JSON en bots/<slug>.json
 
 import os
 import json
 import base64
 import asyncio
 import websockets
-import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import Response, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.websockets import WebSocketState, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 # ===== CONFIG GLOBAL =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -53,7 +52,7 @@ app.add_middleware(
 # ===== Utilidades de audio =====
 def ulaw_silence_b64(ms: int = 20) -> str:
     """Frame de silencio μ-law 8k (20 ms). μ-law silencio = 0xFF."""
-    samples = 8_000 * ms // 1000  # 160 bytes para 20 ms
+    samples = 8_000 * ms // 1000
     return base64.b64encode(b"\xFF" * samples).decode("utf-8")
 
 # ===== Utilidades de bots (JSON) =====
@@ -62,19 +61,13 @@ _JSON_CACHE: Dict[str, Dict[str, Any]] = {}
 def _load_bot_json(slug: str) -> Dict[str, Any]:
     """
     Carga bots/<slug>.json. Si falla, intenta DEFAULT_BOT.
-    Estructura mínima esperada:
-      {
-        "system_prompt": "texto...",
-        "first_message": "Hola, soy ... ¿en qué te ayudo?",
-        "voice": "alloy",
-        "temperature": 0.8,
-        "model": "gpt-4o-realtime-preview",
-        "vad": {
-            "type": "server_vad",
-            "silence_ms": 550,
-            "prefix_ms": 150
-        }
-      }
+    Estructura admitida (campos principales):
+      - system_prompt (str)
+      - first_message (str)
+      - voice (str)
+      - temperature (float)
+      - model (str)
+      - realtime (dict)  # {turn_detection, input_audio_format, output_audio_format}
     """
     slug = (slug or "").strip().lower() or DEFAULT_BOT
     if slug in _JSON_CACHE:
@@ -92,7 +85,6 @@ def _load_bot_json(slug: str) -> Dict[str, Any]:
         cfg = read_json(DEFAULT_BOT)
 
     if cfg is None:
-        # Último recurso: configuración muy básica inline
         cfg = {
             "system_prompt": (
                 "Eres el asistente de voz de In Houston Texas. "
@@ -103,25 +95,31 @@ def _load_bot_json(slug: str) -> Dict[str, Any]:
             "voice": "alloy",
             "temperature": 0.8,
             "model": "gpt-4o-realtime-preview",
-            "vad": {"type": "server_vad", "silence_ms": 550, "prefix_ms": 150}
+            "realtime": {
+                "turn_detection": "server_vad",
+                "input_audio_format": "g711_ulaw",
+                "output_audio_format": "g711_ulaw",
+            },
         }
 
-    # Normalización de claves obligatorias + defaults
+    # Normalización de claves con defaults (manteniendo strings para los formatos)
     cfg.setdefault("voice", "alloy")
     cfg.setdefault("temperature", 0.8)
     cfg.setdefault("system_prompt", "")
+    cfg.setdefault("first_message", "")
     cfg.setdefault("model", "gpt-4o-realtime-preview")
-    cfg.setdefault("vad", {"type": "server_vad", "silence_ms": 550, "prefix_ms": 150})
+    rt = cfg.setdefault("realtime", {})
+    # turn_detection puede ser string o dict; lo convierto a dict si es string
+    if isinstance(rt.get("turn_detection"), str):
+        rt["turn_detection"] = {"type": rt["turn_detection"]}
+    rt.setdefault("turn_detection", {"type": "server_vad"})
+    # formatos como STRING (no object)
+    rt.setdefault("input_audio_format", "g711_ulaw")
+    rt.setdefault("output_audio_format", "g711_ulaw")
+    cfg["realtime"] = rt
+
     _JSON_CACHE[slug] = cfg
     return cfg
-
-def _canon_e164(num: str) -> str:
-    """Normaliza un número de teléfono al formato E.164 básico para mapear TWILIO_BOT_MAP."""
-    s = (num or "").strip()
-    s = s.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-    if s.startswith("00"):
-        s = "+" + s[2:]
-    return s
 
 async def _resolve_bot_slug_from_twilio(request: Request) -> str:
     """
@@ -138,7 +136,7 @@ async def _resolve_bot_slug_from_twilio(request: Request) -> str:
     # 2) cuerpo Twilio (form-urlencoded)
     try:
         form = await request.form()
-        to_number = _canon_e164(form.get("To") or form.get("Called") or "")
+        to_number = (form.get("To") or form.get("Called") or "").strip()
         if to_number and to_number in TWILIO_BOT_MAP:
             return TWILIO_BOT_MAP[to_number].strip().lower()
     except Exception:
@@ -157,6 +155,7 @@ async def root():
 async def twiml_webhook(request: Request):
     host = request.url.hostname or "inhouston-ai-api.onrender.com"
     slug = await _resolve_bot_slug_from_twilio(request)
+    # Pasamos el slug a /media por query
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -186,14 +185,13 @@ async def media_socket(websocket: WebSocket):
     system_prompt = (cfg.get("system_prompt") or "").strip()
     first_message = (cfg.get("first_message") or "").strip()
     model = (cfg.get("model") or "gpt-4o-realtime-preview").strip()
-
-    # VAD opcional por JSON
-    vad_cfg = cfg.get("vad") or {}
-    vad_type = (vad_cfg.get("type") or "server_vad").strip()
-    vad_silence_ms = int(vad_cfg.get("silence_ms", 550))
-    vad_prefix_ms = int(vad_cfg.get("prefix_ms", 150))
+    rt = cfg.get("realtime") or {}
+    in_fmt = rt.get("input_audio_format") or "g711_ulaw"    # STRING
+    out_fmt = rt.get("output_audio_format") or "g711_ulaw"  # STRING
+    turn_det = rt.get("turn_detection") or {"type": "server_vad"}  # dict
 
     print(f"🤖 [BOT] slug={bot_slug} model={model} voice={voice} temp={temperature}")
+    print(f"🎛️  [BOT] realtime={{'turn_detection': {turn_det}, 'input_audio_format': '{in_fmt}', 'output_audio_format': '{out_fmt}'}}")
 
     realtime_uri = f"wss://api.openai.com/v1/realtime?model={model}"
     headers = {
@@ -206,30 +204,14 @@ async def media_socket(websocket: WebSocket):
     # Cola de salida para Twilio (μ-law b64) y emisor ritmado (20 ms)
     outbound_queue: asyncio.Queue[str] = asyncio.Queue()
 
-    # ---- Estado de conversación, barge-in y guards ----
-    speaking_out = False           # True mientras el bot emite TTS
-    barge_cancel_sent = False      # evita doble cancel
-    response_active = False        # hay una response en progreso según el server
-
-    last_tts_ts = 0.0
-    last_audio_rx_ts = 0.0
-    pending_audio_since = 0.0
-
-    # Contadores de input reales (para evitar commits vacíos)
-    USER_FRAME_MS = 20
-    frames_since_commit_ms = 0     # cuánto audio del usuario se ha ENVIADO desde el último commit
-    input_has_data = False         # True si se hizo al menos un append desde el último commit
-
-    # Umbrales
-    BARGE_MIN_USER_MS = 120
-    COMMIT_MIN_MS = 120
-    FORCED_COMMIT_INACT_MS = 0.8
-    FORCED_COMMIT_GAP_MS = 0.6
-
     async def _twilio_send_ulaw_b64(ulaw_b64: str):
+        """Envía un frame μ-law a Twilio (con streamSid si está disponible)."""
         if websocket.application_state != WebSocketState.CONNECTED:
             return
-        payload = {"event": "media", "media": {"payload": ulaw_b64}}
+        payload = {
+            "event": "media",
+            "media": {"payload": ulaw_b64},
+        }
         if stream_sid:
             payload["streamSid"] = stream_sid
         try:
@@ -238,54 +220,18 @@ async def media_socket(websocket: WebSocket):
             print(f"⚠️ [Twilio] envío fallido: {e}")
 
     async def paced_sender():
+        """
+        Consumidor de la cola de salida que envía a Twilio a ~20 ms por frame.
+        Si la cola se queda vacía por >60 ms, envía un silencio de 20 ms (keepalive).
+        """
         SILENCE_20 = ulaw_silence_b64(20)
-        try:
-            while websocket.application_state == WebSocketState.CONNECTED:
-                try:
-                    b64 = await asyncio.wait_for(outbound_queue.get(), timeout=0.06)
-                    await _twilio_send_ulaw_b64(b64)
-                    await asyncio.sleep(0.02)
-                except asyncio.TimeoutError:
-                    await _twilio_send_ulaw_b64(SILENCE_20)
-        except Exception as e:
-            print(f"⚠️ [paced_sender] detenido: {e}")
-
-    async def forced_committer(openai_ws):
-        nonlocal pending_audio_since, last_audio_rx_ts
-        nonlocal frames_since_commit_ms, input_has_data, response_active
-        try:
-            while websocket.application_state == WebSocketState.CONNECTED:
-                await asyncio.sleep(0.2)
-                now = time.time()
-
-                # Inactividad desde que empezó el input
-                if pending_audio_since and (now - pending_audio_since) >= FORCED_COMMIT_INACT_MS:
-                    if input_has_data and frames_since_commit_ms >= COMMIT_MIN_MS and not response_active:
-                        print(f"⏱️ [Force] commit por inactividad VAD ({FORCED_COMMIT_INACT_MS}s)")
-                        await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                        frames_since_commit_ms = 0
-                        input_has_data = False
-                        pending_audio_since = 0.0
-                        await openai_ws.send(json.dumps({"type": "response.create"}))
-                        response_active = True
-                    else:
-                        # No había audio suficiente o hay respuesta activa → solo rearmar
-                        pending_audio_since = 0.0
-
-                # Gap sin recibir audio
-                if last_audio_rx_ts and (now - last_audio_rx_ts) >= FORCED_COMMIT_GAP_MS and pending_audio_since:
-                    if input_has_data and frames_since_commit_ms >= COMMIT_MIN_MS and not response_active:
-                        print(f"⏱️ [Force] commit por gap de audio ({FORCED_COMMIT_GAP_MS}s)")
-                        await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                        frames_since_commit_ms = 0
-                        input_has_data = False
-                        pending_audio_since = 0.0
-                        await openai_ws.send(json.dumps({"type": "response.create"}))
-                        response_active = True
-                    else:
-                        pending_audio_since = 0.0
-        except Exception as e:
-            print(f"⚠️ [forced_committer] {e}")
+        while websocket.application_state == WebSocketState.CONNECTED:
+            try:
+                b64 = await asyncio.wait_for(outbound_queue.get(), timeout=0.06)
+                await _twilio_send_ulaw_b64(b64)
+                await asyncio.sleep(0.02)
+            except asyncio.TimeoutError:
+                await _twilio_send_ulaw_b64(SILENCE_20)
 
     try:
         async with websockets.connect(
@@ -303,15 +249,11 @@ async def media_socket(websocket: WebSocket):
             session_update = {
                 "type": "session.update",
                 "session": {
-                    "turn_detection": {
-                        "type": vad_type,
-                        "silence_duration_ms": vad_silence_ms,
-                        "prefix_padding_ms": vad_prefix_ms,
-                    },
-                    "input_audio_format": "g711_ulaw",
-                    "output_audio_format": "g711_ulaw",
+                    "turn_detection": turn_det,                   # dict
+                    "input_audio_format": in_fmt,                 # STRING ✔
+                    "output_audio_format": out_fmt,               # STRING ✔
                     "voice": voice,
-                    "modalities": ["text", "audio"],
+                    "modalities": ["audio", "text"],             # ✔ combinacion válida
                     "instructions": system_prompt or (
                         "Eres un asistente de voz en español latino. "
                         "Saluda breve, sé útil, agenda citas cuando aplique."
@@ -319,32 +261,25 @@ async def media_socket(websocket: WebSocket):
                     "temperature": temperature,
                 }
             }
-            print(f"➡️  [OpenAI] session.update (voice={voice}, temp={temperature}, vad={vad_type})")
+            print(f"➡️  [OpenAI] session.update (voice={voice}, temp={temperature}, in={in_fmt}, out={out_fmt})")
             await openai_ws.send(json.dumps(session_update))
 
-            # Saludo inicial
+            # Saludo inicial según JSON, con modalidades válidas
             if first_message:
-                await openai_ws.send(json.dumps({
+                initial = {
                     "type": "response.create",
-                    "response": {"instructions": first_message}
-                }))
-                response_active = True
-                print("👋 [OpenAI] first_message disparado")
+                    "response": {"modalities": ["audio", "text"], "instructions": first_message}
+                }
             else:
-                await openai_ws.send(json.dumps({"type": "response.create"}))
-                response_active = True
-                print("👋 [OpenAI] response.create inicial sin first_message")
+                initial = {"type": "response.create", "response": {"modalities": ["audio", "text"]}}
+            await openai_ws.send(json.dumps(initial))
 
-            # Lanzamos auxiliares
+            # Lanzamos el emisor ritmado hacia Twilio
             sender_task = asyncio.create_task(paced_sender())
-            force_task = asyncio.create_task(forced_committer(openai_ws))
 
             # ---- Twilio -> OpenAI (μ-law directo) ----
             async def twilio_to_openai():
-                nonlocal stream_sid, last_audio_rx_ts, pending_audio_since
-                nonlocal speaking_out, barge_cancel_sent
-                nonlocal frames_since_commit_ms, input_has_data, response_active
-                user_ms_while_bot_talking = 0  # local a la llamada
+                nonlocal stream_sid
                 try:
                     while True:
                         msg_txt = await websocket.receive_text()
@@ -356,47 +291,12 @@ async def media_socket(websocket: WebSocket):
                             print(f"🎧 [Twilio] stream START sid={stream_sid}")
 
                         elif ev == "media":
+                            # μ-law base64 tal cual hacia OpenAI
                             ulaw_b64 = data["media"]["payload"]
-
-                            # Contabilidad de audio entrante
-                            last_audio_rx_ts = time.time()
-                            frames_since_commit_ms += USER_FRAME_MS
-                            input_has_data = True
-                            if speaking_out:
-                                user_ms_while_bot_talking += USER_FRAME_MS
-
-                            # BARGE-IN con debounce
-                            if speaking_out and not barge_cancel_sent and user_ms_while_bot_talking >= BARGE_MIN_USER_MS:
-                                try:
-                                    print("🛑 [BARGE-IN] user speaking ≥120ms → response.cancel + flush queue")
-                                    await openai_ws.send(json.dumps({"type": "response.cancel"}))
-                                    barge_cancel_sent = True
-                                    response_active = False  # la respuesta activa ya no debe bloquear
-
-                                    # Vaciar cola TTS
-                                    try:
-                                        while True:
-                                            outbound_queue.get_nowait()
-                                            outbound_queue.task_done()
-                                    except asyncio.QueueEmpty:
-                                        pass
-
-                                    speaking_out = False
-                                    # Importante: NO tocamos frames_since_commit_ms (seguimos acumulando tu voz)
-                                    # Reinicia medición de solape
-                                    user_ms_while_bot_talking = 0
-
-                                except Exception as e:
-                                    print(f"⚠️ [BARGE-IN] fallo al cancelar: {e}")
-
-                            # Enviar audio del usuario al buffer del modelo
                             await openai_ws.send(json.dumps({
                                 "type": "input_audio_buffer.append",
-                                "audio": ulaw_b64
+                                "audio": ulaw_b64  # g711_ulaw base64
                             }))
-
-                            if not pending_audio_since:
-                                pending_audio_since = last_audio_rx_ts
 
                         elif ev == "mark":
                             pass
@@ -408,23 +308,11 @@ async def media_socket(websocket: WebSocket):
                             except Exception:
                                 pass
                             break
-                except WebSocketDisconnect:
-                    print("🔻 [Twilio] WebSocket disconnect")
-                    try:
-                        await openai_ws.close()
-                    except Exception:
-                        pass
                 except Exception as e:
                     print(f"⚠️ [Twilio→OpenAI] Error: {e}")
-                    try:
-                        await openai_ws.close()
-                    except Exception:
-                        pass
 
             # ---- OpenAI -> Twilio ----
             async def openai_to_twilio():
-                nonlocal speaking_out, barge_cancel_sent, response_active
-                nonlocal frames_since_commit_ms, input_has_data, pending_audio_since
                 try:
                     async for raw in openai_ws:
                         try:
@@ -434,55 +322,32 @@ async def media_socket(websocket: WebSocket):
 
                         t = evt.get("type")
 
-                        if t == "error":
-                            print(f"🛑 [OpenAI ERROR] {json.dumps(evt, ensure_ascii=False)}")
-                            # Si el error fue conversation_already_has_active_response, soltamos el lock
-                            try:
-                                code = evt.get("error", {}).get("code")
-                                if code == "conversation_already_has_active_response":
-                                    response_active = True
-                            except Exception:
-                                pass
-                            continue
-
-                        # Logs compactos
+                        # Logs útiles (omitimos frames de audio para no inundar)
                         if t and t not in (
                             "response.audio.delta",
                             "response.output_audio.delta",
                             "input_audio_buffer.speech_started",
                             "input_audio_buffer.speech_stopped",
                         ):
-                            print(f"ℹ️ [OpenAI] {t}")
+                            print(f"ℹ️ [OpenAI] {t} :: {evt}")
 
-                        # Estado de respuesta
-                        if t == "response.created":
-                            response_active = True
-                        if t in ("response.output_item.done", "response.done"):
-                            speaking_out = False
-                            barge_cancel_sent = False
-                            response_active = False
+                        if t == "error":
+                            err = evt.get("error") or evt
+                            print(f"❌ [OpenAI] ERROR DETALLE: {err}")
 
-                        # VAD: fin de habla
+                        # Al detectar fin de habla del usuario: commit + pedir respuesta (audio+texto)
                         if t == "input_audio_buffer.speech_stopped":
-                            print("✂️  [OpenAI] speech_stopped → commit + response.create (si hay audio)")
-                            if input_has_data and frames_since_commit_ms >= COMMIT_MIN_MS and not response_active:
-                                await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                                frames_since_commit_ms = 0
-                                input_has_data = False
-                                pending_audio_since = 0.0
-                                await openai_ws.send(json.dumps({"type": "response.create"}))
-                                response_active = True
-                            else:
-                                # No commit: vacío o ya hay respuesta activa
-                                pass
+                            await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            await openai_ws.send(json.dumps({
+                                "type": "response.create",
+                                "response": {"modalities": ["audio", "text"]}
+                            }))
 
-                        # Audio saliente (TTS)
+                        # Audio saliente
                         if t in ("response.audio.delta", "response.output_audio.delta"):
                             audio_b64 = evt.get("delta") or evt.get("audio")
                             if not audio_b64:
                                 continue
-                            speaking_out = True
-                            last_tts_ts = time.time()
                             await outbound_queue.put(audio_b64)
 
                 except Exception as e:
@@ -490,14 +355,13 @@ async def media_socket(websocket: WebSocket):
 
             await asyncio.gather(twilio_to_openai(), openai_to_twilio())
 
-            # Cerrar auxiliares
-            for task in (sender_task, force_task):
-                if not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+            # Cerrar emisor ritmado
+            if not sender_task.done():
+                sender_task.cancel()
+                try:
+                    await sender_task
+                except asyncio.CancelledError:
+                    pass
 
     except Exception as e:
         import traceback
@@ -505,11 +369,6 @@ async def media_socket(websocket: WebSocket):
         traceback.print_exc()
     finally:
         print("🔴 [Twilio] WebSocket CLOSED")
-        if websocket.application_state == WebSocketState.CONNECTED:
-            try:
-                await websocket.close()
-            except Exception:
-                pass
 
 # ===== Local debug =====
 @app.get("/whoami")
