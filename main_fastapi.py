@@ -1,11 +1,7 @@
 # main_fastapi.py
-# =============================================
-# IN HOUSTON AI — MULTIBOT REALTIME CON FLUJO EFÍMERO (OCT 2025)
-# =============================================
-# - Cada bot tiene su configuración en /bots/<nombre>.json
-# - Crea sesiones efímeras con OpenAI Realtime (igual que avatar_realtime.py)
-# - Compatible con claves sk-proj- y sk-
-# - Totalmente funcional con Twilio Media Streams
+# ============================================================
+# IN HOUSTON AI — MATRIZ MULTIBOT CON FLUJO EFÍMERO (FINAL OCT 2025)
+# ============================================================
 
 import os, json, base64, asyncio, websockets, requests
 from fastapi import FastAPI, WebSocket, Request, Query
@@ -13,15 +9,15 @@ from fastapi.responses import Response, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 
-# =============================================
+# ============================================================
 # CONFIGURACIÓN GLOBAL
-# =============================================
+# ============================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 BOTS_DIR = "bots"
 DEFAULT_MODEL = "gpt-4o-realtime-preview-2024-12-17"
 DEFAULT_VOICE = "alloy"
 
-app = FastAPI(title="IN HOUSTON AI — Multibot Realtime Efímero")
+app = FastAPI(title="IN HOUSTON AI — Multibot Efímero vFinal")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,20 +26,20 @@ app.add_middleware(
 )
 
 def load_bot_config(bot_name: str):
-    """Carga el JSON del bot solicitado."""
+    """Carga el JSON del bot especificado."""
     path = os.path.join(BOTS_DIR, f"{bot_name}.json")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"❌ No existe {path}")
+        raise FileNotFoundError(f"No existe {path}")
     with open(path, "r") as f:
         return json.load(f)
 
 @app.get("/")
 async def root():
-    return PlainTextResponse("✅ IN HOUSTON AI — MATRIZ MULTIBOT EFÍMERA ACTIVA")
+    return PlainTextResponse("✅ IN HOUSTON AI — MATRIZ MULTIBOT EFÍMERA LISTA")
 
-# =============================================
-# TWIML — ENTRADA DE LLAMADA DESDE TWILIO
-# =============================================
+# ============================================================
+# TWIML: CREA TOKEN EFÍMERO ANTES DE DEVOLVER EL <Stream>
+# ============================================================
 @app.post("/twiml")
 async def twiml_webhook(request: Request, bot: str = Query(...)):
     try:
@@ -51,45 +47,13 @@ async def twiml_webhook(request: Request, bot: str = Query(...)):
     except Exception:
         return PlainTextResponse("Bot no encontrado", status_code=404)
 
-    host = request.url.hostname or "inhouston-ai-api.onrender.com"
-    greeting = cfg.get("greeting", "Hola, soy tu asistente de In Houston Texas.")
-    twilio_voice = cfg.get("twilio", {}).get("voice", "Polly.Lucia-Neural")
-    twilio_lang = cfg.get("twilio", {}).get("language", "es-MX")
-
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="{twilio_voice}" language="{twilio_lang}">{greeting}</Say>
-  <Connect>
-    <Stream url="wss://{host}/media?bot={bot}" />
-  </Connect>
-</Response>"""
-    return Response(content=xml, media_type="application/xml")
-
-# =============================================
-# WEBSOCKET PRINCIPAL /media (Twilio ↔ OpenAI)
-# =============================================
-@app.websocket("/media")
-async def media_socket(ws: WebSocket, bot: str):
-    await ws.accept()
-    print(f"🟢 Twilio conectado para bot={bot}")
-
-    try:
-        cfg = load_bot_config(bot)
-    except Exception as e:
-        print(f"❌ Error cargando bot '{bot}': {e}")
-        await ws.close()
-        return
-
-    # --- Cargar info del JSON ---
+    # --- Construir sesión efímera antes del Stream ---
     model = cfg.get("model", DEFAULT_MODEL)
     voice = cfg.get("voice", DEFAULT_VOICE)
     instructions = cfg.get("instructions", "")
     temperature = cfg.get("temperature", 0.8)
     turn_detection = (cfg.get("realtime", {}) or {}).get("turn_detection", "server_vad")
 
-    # =============================================
-    # 1️⃣ Crear sesión efímera (como avatar_realtime)
-    # =============================================
     session_payload = {
         "model": model,
         "voice": voice,
@@ -100,101 +64,133 @@ async def media_socket(ws: WebSocket, bot: str):
     }
 
     try:
-        resp = requests.post(
+        r = requests.post(
             "https://api.openai.com/v1/realtime/sessions",
             headers={
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                 "Content-Type": "application/json",
-                "OpenAI-Beta": "realtime=v1",
+                "OpenAI-Beta": "realtime=v1"
             },
             json=session_payload,
-            timeout=20,
+            timeout=15,
         )
-        if resp.status_code >= 400:
-            print("❌ Error creando sesión efímera:", resp.text)
-            await ws.close()
-            return
-        ephemeral = resp.json()
-        ephemeral_token = ephemeral.get("client_secret", {}).get("value")
-        if not ephemeral_token:
-            print("❌ No se recibió token efímero")
-            await ws.close()
-            return
+        r.raise_for_status()
+        data = r.json()
+        ephemeral_token = data["client_secret"]["value"]
+        print(f"🔑 Sesión efímera creada para bot={bot}")
     except Exception as e:
-        print("❌ Fallo creando sesión efímera:", e)
-        await ws.close()
+        print("❌ Error creando sesión efímera:", e)
+        return PlainTextResponse("Error al crear sesión efímera", status_code=500)
+
+    # --- Construir TwiML con token ya incluido ---
+    host = request.url.hostname or "inhouston-ai-api.onrender.com"
+    greeting = cfg.get("greeting", "Hola, soy tu asistente de In Houston Texas.")
+    twilio_voice = cfg.get("twilio", {}).get("voice", "Polly.Lucia-Neural")
+    twilio_lang = cfg.get("twilio", {}).get("language", "es-MX")
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="{twilio_voice}" language="{twilio_lang}">{greeting}</Say>
+  <Connect>
+    <Stream url="wss://{host}/media?bot={bot}&token={ephemeral_token}" />
+  </Connect>
+</Response>"""
+    return Response(content=xml.strip(), media_type="application/xml")
+
+# ============================================================
+# MEDIA SOCKET: CONEXIÓN TWILIO ↔ OPENAI (USA TOKEN RECIBIDO)
+# ============================================================
+@app.websocket("/media")
+async def media_socket(ws: WebSocket, bot: str, token: str):
+    await ws.accept()
+    print(f"🟢 Twilio conectado (bot={bot})")
+
+    if not token:
+        print("❌ Falta token efímero")
+        await ws.close(code=403)
         return
 
-    print("🔑 Sesión efímera creada OK")
+    try:
+        cfg = load_bot_config(bot)
+    except Exception as e:
+        print(f"❌ Error cargando JSON del bot '{bot}': {e}")
+        await ws.close(code=1011)
+        return
 
-    # =============================================
-    # 2️⃣ Conectar a OpenAI con token efímero
-    # =============================================
+    # Conectar a OpenAI Realtime usando el token efímero recibido
     headers = {
-        "Authorization": f"Bearer {ephemeral_token}",
+        "Authorization": f"Bearer {token}",
         "OpenAI-Beta": "realtime=v1"
     }
+    model = cfg.get("model", DEFAULT_MODEL)
     uri = f"wss://api.openai.com/v1/realtime?model={model}"
 
     try:
         async with websockets.connect(
-            uri,
-            extra_headers=headers,
-            subprotocols=["realtime"],
-            ping_interval=10,
-            ping_timeout=20
+            uri, extra_headers=headers, subprotocols=["realtime"],
+            ping_interval=10, ping_timeout=20
         ) as oai:
-            print("🔗 [OpenAI] Conectado (sesión efímera)")
+            print("🔗 [OpenAI] conectado (sesión efímera activa)")
 
-            # ---- Twilio → OpenAI ----
+            # --- Twilio → OpenAI ---
             async def twilio_to_openai():
                 while True:
-                    msg = await ws.receive_text()
-                    data = json.loads(msg)
-                    ev = data.get("event")
-                    if ev == "media":
-                        ulaw_b64 = data["media"]["payload"]
-                        await oai.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": ulaw_b64
-                        }))
-                    elif ev == "stop":
-                        print("🛑 Fin de llamada Twilio")
-                        await oai.close()
+                    try:
+                        msg = await ws.receive_text()
+                        data = json.loads(msg)
+                        ev = data.get("event")
+
+                        if ev == "media":
+                            ulaw_b64 = data["media"]["payload"]
+                            await oai.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": ulaw_b64
+                            }))
+                        elif ev == "stop":
+                            print("🛑 Llamada terminada")
+                            await oai.close()
+                            break
+                    except Exception as e:
+                        print("⚠️ Error Twilio→OpenAI:", e)
                         break
 
-            # ---- OpenAI → Twilio ----
+            # --- OpenAI → Twilio ---
             async def openai_to_twilio():
                 async for raw in oai:
-                    evt = json.loads(raw)
-                    typ = evt.get("type")
+                    try:
+                        evt = json.loads(raw)
+                        typ = evt.get("type")
 
-                    if typ in ("response.audio.delta", "response.output_audio.delta"):
-                        audio_b64 = evt.get("delta") or evt.get("audio")
-                        if audio_b64:
-                            await ws.send_text(json.dumps({
-                                "event": "media",
-                                "media": {"payload": audio_b64}
-                            }))
+                        if typ in ("response.audio.delta", "response.output_audio.delta"):
+                            audio_b64 = evt.get("delta") or evt.get("audio")
+                            if audio_b64:
+                                await ws.send_text(json.dumps({
+                                    "event": "media",
+                                    "media": {"payload": audio_b64}
+                                }))
 
-                    elif typ == "input_audio_buffer.speech_stopped":
-                        await oai.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                        await oai.send(json.dumps({"type": "response.create"}))
+                        elif typ == "input_audio_buffer.speech_stopped":
+                            await oai.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            await oai.send(json.dumps({"type": "response.create"}))
+
+                    except Exception as e:
+                        print("⚠️ Error OpenAI→Twilio:", e)
+                        break
 
             await asyncio.gather(twilio_to_openai(), openai_to_twilio())
 
     except Exception as e:
-        print("❌ Error global:", e)
+        print("❌ Error global WS:", e)
     finally:
-        print(f"🔴 WS cerrado ({bot})")
+        print(f"🔴 Conexión cerrada para bot={bot}")
         await ws.close()
 
-# =============================================
+# ============================================================
 # LOCAL DEBUG
-# =============================================
+# ============================================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8080))
-    print("🧠 IN HOUSTON AI — MATRIZ MULTIBOT INICIADA")
+    print("🧠 IN HOUSTON AI — MATRIZ MULTIBOT EFÍMERA INICIADA")
     print(f"📦 BOTS_DIR: {BOTS_DIR}")
     uvicorn.run("main_fastapi:app", host="0.0.0.0", port=port, reload=True)
