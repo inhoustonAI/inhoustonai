@@ -17,7 +17,7 @@ from starlette.websockets import WebSocketState
 
 # ========= CONFIG GLOBAL =========
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-BOTS_DIR = "bots"
+BOTS_DIR = os.path.join("app", "bots")
 DEFAULT_MODEL = "gpt-4o-realtime-preview-2024-12-17"
 DEFAULT_VOICE = "alloy"
 
