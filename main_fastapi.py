@@ -1,9 +1,9 @@
 # main_fastapi.py
-# Versión multibot Twilio ↔ OpenAI Realtime (oct 2025)
+# Versión multibot Twilio ↔ OpenAI Realtime (oct 2025) — FIX saludo + respeta JSON
 # - μ-law 8 kHz end-to-end (sin resampling)
 # - VAD de servidor (turn_detection) en OpenAI
 # - Ritmo 20 ms hacia Twilio para audio estable
-# - MATRIZ: saludo, instrucciones, voz y temperatura vienen del JSON en bots/<slug>.json
+# - MATRIZ: saludo, instrucciones, voz, temperatura, modelo y realtime vienen del JSON en bots/<slug>.json
 
 import os
 import json
@@ -27,9 +27,6 @@ BOTS_DIR = Path(os.getenv("BOTS_DIR", "bots"))
 DEFAULT_BOT = os.getenv("DEFAULT_BOT", "sundin")
 
 # Mapa opcional: número de destino (To) → slug de bot
-# Ejemplo env:
-#   TWILIO_BOT_MAP={"+" "17862237089":"sundin","+18323790809":"ventas"}
-# (sin el espacio entre + y " — lo agrego aquí solo para que no rompa formato)
 _TWILIO_BOT_MAP_RAW = os.getenv("TWILIO_BOT_MAP", "{}")
 try:
     TWILIO_BOT_MAP: Dict[str, str] = json.loads(_TWILIO_BOT_MAP_RAW)
@@ -37,7 +34,7 @@ except Exception:
     TWILIO_BOT_MAP = {}
 
 print(f"🧩 Using PORT: {PORT}")
-print(f"🧩 BOTS_DIR: {BOTS_DIR.resolve()}")
+print(f"🧩 BOTS_DIR: {BOTS_DIR.resolve()} (exists={BOTS_DIR.exists()})")
 print(f"🧩 DEFAULT_BOT: {DEFAULT_BOT}")
 print(f"🧩 TWILIO_BOT_MAP: {TWILIO_BOT_MAP}")
 
@@ -64,13 +61,13 @@ _JSON_CACHE: Dict[str, Dict[str, Any]] = {}
 def _load_bot_json(slug: str) -> Dict[str, Any]:
     """
     Carga bots/<slug>.json. Si falla, intenta DEFAULT_BOT.
-    Estructura esperada mínima:
-      {
-        "system_prompt": "texto...",
-        "first_message": "Hola, soy ... ¿en qué te ayudo?",
-        "voice": "alloy",
-        "temperature": 0.8
-      }
+    Estructura admitida (campos principales):
+      - system_prompt (str)
+      - first_message (str)
+      - voice (str)
+      - temperature (float)
+      - model (str)
+      - realtime (dict)  # e.g. {turn_detection, input_audio_format, output_audio_format}
     """
     slug = (slug or "").strip().lower() or DEFAULT_BOT
     if slug in _JSON_CACHE:
@@ -88,7 +85,7 @@ def _load_bot_json(slug: str) -> Dict[str, Any]:
         cfg = read_json(DEFAULT_BOT)
 
     if cfg is None:
-        # Último recurso: configuración muy básica inline
+        # Último recurso: configuración mínima
         cfg = {
             "system_prompt": (
                 "Eres el asistente de voz de In Houston Texas. "
@@ -98,12 +95,37 @@ def _load_bot_json(slug: str) -> Dict[str, Any]:
             "first_message": "Hola, soy el asistente de In Houston Texas. ¿En qué te ayudo?",
             "voice": "alloy",
             "temperature": 0.8,
+            "model": "gpt-4o-realtime-preview",
+            "realtime": {
+                "turn_detection": "server_vad",
+                "input_audio_format": "g711_ulaw",
+                "output_audio_format": "g711_ulaw",
+            },
         }
 
-    # Normalización de claves
+    # Normalización de claves con defaults
     cfg.setdefault("voice", "alloy")
     cfg.setdefault("temperature", 0.8)
     cfg.setdefault("system_prompt", "")
+    cfg.setdefault("first_message", "")
+    cfg.setdefault("model", "gpt-4o-realtime-preview")
+    cfg.setdefault("realtime", {})
+    # Normalizar realtime a dict con claves esperadas
+    rt = cfg["realtime"] or {}
+    if isinstance(rt.get("turn_detection"), str):
+        rt["turn_detection"] = {"type": rt["turn_detection"]}
+    rt.setdefault("turn_detection", {"type": "server_vad"})
+    # Asegurar formatos g711_ulaw por defecto
+    in_fmt = rt.get("input_audio_format") or "g711_ulaw"
+    out_fmt = rt.get("output_audio_format") or "g711_ulaw"
+    if isinstance(in_fmt, str):
+        in_fmt = {"type": in_fmt}
+    if isinstance(out_fmt, str):
+        out_fmt = {"type": out_fmt}
+    rt["input_audio_format"] = in_fmt
+    rt["output_audio_format"] = out_fmt
+    cfg["realtime"] = rt
+
     _JSON_CACHE[slug] = cfg
     return cfg
 
@@ -167,13 +189,16 @@ async def media_socket(websocket: WebSocket):
     cfg = _load_bot_json(bot_slug)
 
     voice = cfg.get("voice", "alloy")
-    temperature = cfg.get("temperature", 0.8)
-    system_prompt = cfg.get("system_prompt", "").strip()
+    temperature = float(cfg.get("temperature", 0.8))
+    system_prompt = (cfg.get("system_prompt") or "").strip()
     first_message = (cfg.get("first_message") or "").strip()
+    model = (cfg.get("model") or "gpt-4o-realtime-preview").strip()
+    rt = cfg.get("realtime") or {}
 
-    print(f"🤖 [BOT] slug={bot_slug} voice={voice} temp={temperature}")
+    print(f"🤖 [BOT] slug={bot_slug} model={model} voice={voice} temp={temperature}")
+    print(f"🎛️  [BOT] realtime={rt}")
 
-    realtime_uri = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+    realtime_uri = f"wss://api.openai.com/v1/realtime?model={model}"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "OpenAI-Beta": "realtime=v1",
@@ -226,34 +251,38 @@ async def media_socket(websocket: WebSocket):
             print("🔗 [OpenAI] Realtime CONNECTED")
 
             # ---- Configurar sesión con parámetros del JSON ----
+            # Mezclamos turn_detection + formatos desde el JSON (normalizados arriba)
             session_update = {
                 "type": "session.update",
                 "session": {
-                    "turn_detection": {"type": "server_vad"},
-                    "input_audio_format": "g711_ulaw",
-                    "output_audio_format": "g711_ulaw",
+                    "turn_detection": rt.get("turn_detection", {"type": "server_vad"}),
+                    "input_audio_format": rt.get("input_audio_format", {"type": "g711_ulaw"}),
+                    "output_audio_format": rt.get("output_audio_format", {"type": "g711_ulaw"}),
                     "voice": voice,
                     "modalities": ["text", "audio"],
                     "instructions": system_prompt or (
                         "Eres un asistente de voz en español latino. "
                         "Saluda breve, sé útil, agenda citas cuando aplique."
                     ),
-                    "temperature": float(temperature),
+                    "temperature": temperature,
                 }
             }
             print(f"➡️  [OpenAI] session.update (voice={voice}, temp={temperature})")
             await openai_ws.send(json.dumps(session_update))
 
             # (Opcional) Saludo inicial controlado por JSON:
+            # Algunos previews requieren 'modalities:["audio"]' en la propia respuesta.
             if first_message:
-                # Forzamos primer mensaje con 'instructions' de la respuesta
-                await openai_ws.send(json.dumps({
+                initial = {
                     "type": "response.create",
-                    "response": {"instructions": first_message}
-                }))
+                    "response": {
+                        "modalities": ["audio"],
+                        "instructions": first_message
+                    }
+                }
             else:
-                # Si no hay first_message, pedimos respuesta estándar (según system_prompt)
-                await openai_ws.send(json.dumps({"type": "response.create"}))
+                initial = {"type": "response.create", "response": {"modalities": ["audio"]}}
+            await openai_ws.send(json.dumps(initial))
 
             # Lanzamos el emisor ritmado hacia Twilio
             sender_task = asyncio.create_task(paced_sender())
@@ -310,12 +339,20 @@ async def media_socket(websocket: WebSocket):
                             "input_audio_buffer.speech_started",
                             "input_audio_buffer.speech_stopped",
                         ):
-                            print(f"ℹ️ [OpenAI] {t}")
+                            print(f"ℹ️ [OpenAI] {t} :: {evt}")
 
-                        # Al detectar fin de habla: commit + pedir respuesta
+                        # Si llega un 'error', mostramos detalle y pedimos fallback
+                        if t == "error":
+                            err = evt.get("error") or evt
+                            print(f"❌ [OpenAI] ERROR DETALLE: {err}")
+
+                        # Al detectar fin de habla del usuario: commit + pedir respuesta
                         if t == "input_audio_buffer.speech_stopped":
                             await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                            await openai_ws.send(json.dumps({"type": "response.create"}))
+                            await openai_ws.send(json.dumps({
+                                "type": "response.create",
+                                "response": {"modalities": ["audio"]}
+                            }))
 
                         # Audio saliente (nombres varían entre previews)
                         if t in ("response.audio.delta", "response.output_audio.delta"):
