@@ -1,9 +1,9 @@
 # =============================================================
-# IN HOUSTON AI — MATRIZ MULTIBOT ESTABLE (Oct 2025)
+# IN HOUSTON AI — MATRIZ MULTIBOT ESTABLE FINAL (Oct 2025)
 # =============================================================
+# - Conecta Twilio ↔ OpenAI Realtime (g711_ulaw 8k)
+# - Fluidez total: inicia OpenAI antes de recibir audio
 # - Soporta múltiples bots (uno por JSON en /bots/)
-# - Compatible con Twilio Media Stream sin ?bot=
-# - Conexión Realtime a OpenAI 100% estable (voz y turnos)
 # =============================================================
 
 import os, json, base64, asyncio, websockets
@@ -12,12 +12,11 @@ from fastapi.responses import Response, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState
 
-# ============ CONFIGURACIÓN GLOBAL ============
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 BOTS_DIR = "bots"
 PORT = int(os.getenv("PORT", 8080))
 APP_NAME = "IN HOUSTON AI — MATRIZ MULTIBOT"
-ACTIVE_STREAMS = {}
+ACTIVE_BOT = {"last": "sundin"}  # Valor por defecto
 
 app = FastAPI(title=APP_NAME)
 app.add_middleware(
@@ -29,7 +28,7 @@ app.add_middleware(
 print("🧠 IN HOUSTON AI — MATRIZ MULTIBOT INICIADA")
 print(f"📦 BOTS_DIR: {BOTS_DIR}")
 
-# ============ FUNCIONES AUXILIARES ============
+# ---------- Utilidades ----------
 def load_bot_config(bot_name: str):
     path = os.path.join(BOTS_DIR, f"{bot_name.lower()}.json")
     if not os.path.exists(path):
@@ -41,12 +40,12 @@ def ulaw_silence_b64(ms=20):
     samples = 8_000 * ms // 1000
     return base64.b64encode(b"\xFF" * samples).decode("utf-8")
 
-# ============ ENDPOINT DE SALUD ============
+# ---------- Salud ----------
 @app.get("/")
 async def root():
-    return PlainTextResponse("✅ IN HOUSTON AI — MATRIZ MULTIBOT LISTA")
+    return PlainTextResponse("✅ IN HOUSTON AI — MATRIZ MULTIBOT ACTIVA")
 
-# ============ TWIML ============
+# ---------- TwiML ----------
 @app.post("/twiml")
 async def twiml_webhook(request: Request, bot: str = Query(...)):
     try:
@@ -60,6 +59,9 @@ async def twiml_webhook(request: Request, bot: str = Query(...)):
     lang = cfg.get("twilio", {}).get("language", "es-MX")
     greeting = cfg.get("greeting", f"Hola, soy {bot.capitalize()} de In Houston Texas.")
 
+    ACTIVE_BOT["last"] = bot
+    print(f"📞 Llamada entrante para bot={bot}")
+
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="{voice}" language="{lang}">{greeting}</Say>
@@ -68,81 +70,31 @@ async def twiml_webhook(request: Request, bot: str = Query(...)):
   </Connect>
 </Response>"""
 
-    print(f"📞 Llamada entrante para bot={bot}")
-    ACTIVE_STREAMS["last_bot"] = bot  # Registramos el último bot activo
     return Response(content=xml.strip(), media_type="application/xml")
 
-# ============ WEBSOCKET PRINCIPAL ============
+# ---------- WebSocket principal ----------
 @app.websocket("/media")
 async def media_socket(websocket: WebSocket):
     await websocket.accept()
     print("🟢 [Twilio] Conexión WS abierta")
 
-    stream_sid = None
-    bot_name = ACTIVE_STREAMS.get("last_bot", "sundin")
-    outbound_queue = asyncio.Queue()
+    bot = ACTIVE_BOT.get("last", "sundin")
+    cfg = load_bot_config(bot)
 
-    async def twilio_to_openai(openai_ws):
-        nonlocal stream_sid
-        try:
-            while True:
-                msg = json.loads(await websocket.receive_text())
-                ev = msg.get("event")
+    model = cfg.get("model", "gpt-4o-realtime-preview-2024-12-17")
+    voice = cfg.get("voice", "alloy")
+    instructions = cfg.get("instructions", "")
+    temp = cfg.get("temperature", 0.8)
 
-                if ev == "start":
-                    stream_sid = msg["start"]["streamSid"]
-                    ACTIVE_STREAMS[stream_sid] = bot_name
-                    print(f"🎧 [Twilio] stream START sid={stream_sid} (bot={bot_name})")
-
-                elif ev == "media":
-                    await openai_ws.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": msg["media"]["payload"]
-                    }))
-
-                elif ev == "stop":
-                    print(f"🛑 [Twilio] stream STOP ({stream_sid})")
-                    await openai_ws.close()
-                    break
-        except Exception as e:
-            print(f"⚠️ [Twilio→OpenAI] Error: {e}")
-
-    async def openai_to_twilio(openai_ws):
-        try:
-            async for raw in openai_ws:
-                evt = json.loads(raw)
-                t = evt.get("type")
-
-                if t == "input_audio_buffer.speech_stopped":
-                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    await openai_ws.send(json.dumps({"type": "response.create"}))
-
-                elif t in ("response.audio.delta", "response.output_audio.delta"):
-                    ulaw_b64 = evt.get("delta") or evt.get("audio")
-                    if ulaw_b64:
-                        await websocket.send_text(json.dumps({
-                            "event": "media",
-                            "media": {"payload": ulaw_b64}
-                        }))
-        except Exception as e:
-            print(f"⚠️ [OpenAI→Twilio] Error: {e}")
+    # Conectamos OpenAI antes de recibir audio
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
+    uri = f"wss://api.openai.com/v1/realtime?model={model}"
 
     try:
-        cfg = load_bot_config(bot_name)
-        model = cfg.get("model", "gpt-4o-realtime-preview-2024-12-17")
-        voice = cfg.get("voice", "alloy")
-        instructions = cfg.get("instructions", "")
-        temp = cfg.get("temperature", 0.8)
-
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1"
-        }
-        uri = f"wss://api.openai.com/v1/realtime?model={model}"
-
         async with websockets.connect(uri, extra_headers=headers, subprotocols=["realtime"]) as openai_ws:
-            print(f"🤖 [OpenAI] Conectado — bot={bot_name}")
+            print(f"🤖 [OpenAI] Conectado — bot={bot}")
 
+            # Configuración inicial
             await openai_ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
@@ -157,20 +109,57 @@ async def media_socket(websocket: WebSocket):
             }))
             await openai_ws.send(json.dumps({"type": "response.create"}))
 
-            await asyncio.gather(
-                twilio_to_openai(openai_ws),
-                openai_to_twilio(openai_ws)
-            )
+            async def twilio_to_openai():
+                try:
+                    while True:
+                        msg = json.loads(await websocket.receive_text())
+                        ev = msg.get("event")
+
+                        if ev == "media":
+                            await openai_ws.send(json.dumps({
+                                "type": "input_audio_buffer.append",
+                                "audio": msg["media"]["payload"]
+                            }))
+
+                        elif ev == "stop":
+                            print("🛑 [Twilio] STOP recibido — cerrando OpenAI")
+                            await openai_ws.close()
+                            break
+
+                except Exception as e:
+                    print(f"⚠️ [Twilio→OpenAI] Error: {e}")
+
+            async def openai_to_twilio():
+                try:
+                    async for raw in openai_ws:
+                        evt = json.loads(raw)
+                        t = evt.get("type")
+
+                        if t == "input_audio_buffer.speech_stopped":
+                            await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            await openai_ws.send(json.dumps({"type": "response.create"}))
+
+                        elif t in ("response.audio.delta", "response.output_audio.delta"):
+                            ulaw_b64 = evt.get("delta") or evt.get("audio")
+                            if ulaw_b64:
+                                await websocket.send_text(json.dumps({
+                                    "event": "media",
+                                    "media": {"payload": ulaw_b64}
+                                }))
+                except Exception as e:
+                    print(f"⚠️ [OpenAI→Twilio] Error: {e}")
+
+            await asyncio.gather(twilio_to_openai(), openai_to_twilio())
 
     except Exception as e:
         import traceback
-        print("❌ [OpenAI] Error global:", e)
+        print("❌ Error global en /media:", e)
         traceback.print_exc()
 
     finally:
         print("🔴 [Twilio] WS cerrado")
 
-# ============ LOCAL DEBUG ============
+# ---------- Local debug ----------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main_fastapi:app", host="0.0.0.0", port=PORT, reload=True)
