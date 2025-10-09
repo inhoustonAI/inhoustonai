@@ -2,11 +2,13 @@
 # - Un teléfono = un bot (estricto opcional)
 # - Lee voz/temperatura/saludo/prompt/modelo desde bots/<slug>.json
 # - μ-law 8 kHz end-to-end, VAD server y pacing ~20 ms
-# - Logs de diagnóstico: ruta del JSON y resumen de claves
+# - Normaliza E.164 y parsea form sin depender de python-multipart
+# - Logs de diagnóstico (To crudo/normalizado, mapa, ruta JSON)
 
-import os, json, base64, asyncio, websockets
+import os, json, base64, asyncio, websockets, re
 from pathlib import Path
 from typing import Optional, Dict, Any
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import Response, PlainTextResponse
@@ -28,7 +30,6 @@ except Exception:
 
 # Estricto: si el número no está en el mapa y no hay ?bot= → cuelga (sin fallback)
 ROUTING_STRICT = os.getenv("ROUTING_STRICT", "1").lower() in ("1", "true", "yes")
-
 # Permitir forzar bot con query ?bot= (útil en pruebas)
 ALLOW_QUERY_OVERRIDE = os.getenv("ALLOW_QUERY_OVERRIDE", "1").lower() in ("1", "true", "yes")
 
@@ -48,11 +49,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===== Utilidades de audio =====
+# ===== Utilidades =====
 def ulaw_silence_b64(ms: int = 20) -> str:
     """Frame de silencio μ-law 8k (20 ms). μ-law silencio = 0xFF."""
     samples = 8_000 * ms // 1000
     return base64.b64encode(b"\xFF" * samples).decode("utf-8")
+
+def norm_e164(s: str) -> str:
+    """Normaliza a E.164: mantiene dígitos, asegura + al inicio si lo tenía."""
+    if not s:
+        return ""
+    s = s.strip()
+    had_plus = s.startswith("+")
+    digits = re.sub(r"\D+", "", s)
+    if not digits:
+        return ""
+    return ("+" if had_plus or s.startswith("%2B") else "+") + digits
 
 # ===== Utilidades de bots (JSON) =====
 _JSON_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -110,25 +122,46 @@ async def _resolve_bot_slug_from_twilio(request: Request) -> Optional[str]:
     """
     Prioridad:
       1) query ?bot=slug (si ALLOW_QUERY_OVERRIDE=1)
-      2) map por número To (TWILIO_BOT_MAP)
-      3) si ROUTING_STRICT=1 → None (mensaje y cuelga), si no → None (sin usar)
+      2) map por número To (lee form x-www-form-urlencoded con o sin python-multipart)
+      3) si ROUTING_STRICT=1 → None (mensaje y cuelga)
     """
-    # 1) query
+    # 1) override por query (pruebas)
     if ALLOW_QUERY_OVERRIDE:
         q = dict(request.query_params)
-        if "bot" in q and q["bot"].strip():
+        if q.get("bot"):
             return q["bot"].strip().lower()
 
-    # 2) cuerpo Twilio (form-urlencoded)
+    # 2) intento 1: FastAPI form() (si existe python-multipart)
+    to_raw = ""
     try:
         form = await request.form()
-        to_number = (form.get("To") or form.get("Called") or "").strip()
-        if to_number:
-            print(f"☎️  [Twilio] To={to_number}")
-        if to_number and to_number in TWILIO_BOT_MAP:
-            return TWILIO_BOT_MAP[to_number].strip().lower()
+        to_raw = (form.get("To") or form.get("Called") or "").strip()
+        if to_raw:
+            print(f"☎️  [Twilio] To (form) = {to_raw}")
     except Exception as e:
-        print(f"⚠️ [Twilio] No se pudo leer form: {e}")
+        print(f"⚠️ [Twilio] No se pudo leer form() [{e}]. Intentando parseo manual…")
+
+    # 2-b) si no vino por form(), intenta parseo manual del body
+    if not to_raw:
+        try:
+            raw = await request.body()          # bytes
+            body = raw.decode("utf-8", "ignore")
+            data = {k: v[0] for k, v in parse_qs(body, keep_blank_values=True).items()}
+            to_raw = (data.get("To") or data.get("Called") or "").strip()
+            if to_raw:
+                print(f"☎️  [Twilio] To (body) = {to_raw}")
+        except Exception as e:
+            print(f"⚠️ [Twilio] Parseo manual falló: {e}")
+
+    to_norm = norm_e164(to_raw)
+    keys_norm = [norm_e164(k) for k in TWILIO_BOT_MAP.keys()]
+    print(f"🔧 [Twilio] To normalizado: {to_norm} | keys: {keys_norm}")
+
+    if to_norm and to_norm in [norm_e164(k) for k in TWILIO_BOT_MAP.keys()]:
+        # encuentra el slug original respetando el key exacto
+        for k, v in TWILIO_BOT_MAP.items():
+            if norm_e164(k) == to_norm:
+                return v.strip().lower()
 
     # 3) estricto → None (para devolver TwiML de error)
     return None
@@ -154,7 +187,6 @@ async def twiml_webhook(request: Request):
 </Response>"""
             return Response(content=xml.strip(), media_type="application/xml")
         else:
-            # Modo no estricto: usa un fallback "demo"
             slug = "default"
 
     # Cargar JSON aquí para fallar pronto si no existe
@@ -211,18 +243,12 @@ async def media_socket(websocket: WebSocket):
     }
 
     stream_sid: Optional[str] = None
-
-    # Cola de salida para Twilio (μ-law b64) y emisor ritmado (20 ms)
     outbound_queue: asyncio.Queue[str] = asyncio.Queue()
 
     async def _twilio_send_ulaw_b64(ulaw_b64: str):
-        """Envía un frame μ-law a Twilio (con streamSid si está disponible)."""
         if websocket.application_state != WebSocketState.CONNECTED:
             return
-        payload = {
-            "event": "media",
-            "media": {"payload": ulaw_b64},
-        }
+        payload = {"event": "media", "media": {"payload": ulaw_b64}}
         if stream_sid:
             payload["streamSid"] = stream_sid
         try:
@@ -231,10 +257,6 @@ async def media_socket(websocket: WebSocket):
             print(f"⚠️ [Twilio] envío fallido: {e}")
 
     async def paced_sender():
-        """
-        Consumidor de la cola de salida que envía a Twilio a ~20 ms por frame.
-        Si la cola se queda vacía por >60 ms, envía un silencio de 20 ms (keepalive).
-        """
         SILENCE_20 = ulaw_silence_b64(20)
         while websocket.application_state == WebSocketState.CONNECTED:
             try:
@@ -249,14 +271,11 @@ async def media_socket(websocket: WebSocket):
             realtime_uri,
             extra_headers=headers,
             subprotocols=["realtime"],
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=5,
+            ping_interval=20, ping_timeout=20, close_timeout=5,
             max_size=10_000_000,
         ) as openai_ws:
             print("🔗 [OpenAI] Realtime CONNECTED")
 
-            # ---- Configurar sesión con parámetros del JSON ----
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -275,7 +294,6 @@ async def media_socket(websocket: WebSocket):
             print(f"➡️  [OpenAI] session.update (voice={voice}, temp={temperature})")
             await openai_ws.send(json.dumps(session_update))
 
-            # (Opcional) Saludo inicial controlado por JSON:
             if first_message:
                 await openai_ws.send(json.dumps({
                     "type": "response.create",
@@ -284,10 +302,8 @@ async def media_socket(websocket: WebSocket):
             else:
                 await openai_ws.send(json.dumps({"type": "response.create"}))
 
-            # Lanzamos el emisor ritmado hacia Twilio
             sender_task = asyncio.create_task(paced_sender())
 
-            # ---- Twilio -> OpenAI (μ-law directo) ----
             async def twilio_to_openai():
                 nonlocal stream_sid
                 try:
@@ -301,11 +317,10 @@ async def media_socket(websocket: WebSocket):
                             print(f"🎧 [Twilio] stream START sid={stream_sid}")
 
                         elif ev == "media":
-                            # μ-law base64 tal cual hacia OpenAI
                             ulaw_b64 = data["media"]["payload"]
                             await openai_ws.send(json.dumps({
                                 "type": "input_audio_buffer.append",
-                                "audio": ulaw_b64  # g711_ulaw base64
+                                "audio": ulaw_b64
                             }))
 
                         elif ev == "stop":
@@ -318,7 +333,6 @@ async def media_socket(websocket: WebSocket):
                 except Exception as e:
                     print(f"⚠️ [Twilio→OpenAI] Error: {e}")
 
-            # ---- OpenAI -> Twilio ----
             async def openai_to_twilio():
                 try:
                     async for raw in openai_ws:
@@ -329,7 +343,6 @@ async def media_socket(websocket: WebSocket):
 
                         t = evt.get("type")
 
-                        # Logs útiles (omitimos frames de audio para no inundar)
                         if t and t not in (
                             "response.audio.delta",
                             "response.output_audio.delta",
@@ -338,24 +351,20 @@ async def media_socket(websocket: WebSocket):
                         ):
                             print(f"ℹ️ [OpenAI] {t}")
 
-                        # Al detectar fin de habla: commit + pedir respuesta
                         if t == "input_audio_buffer.speech_stopped":
                             await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                             await openai_ws.send(json.dumps({"type": "response.create"}))
 
-                        # Audio saliente (nombres varían entre previews)
                         if t in ("response.audio.delta", "response.output_audio.delta"):
                             audio_b64 = evt.get("delta") or evt.get("audio")
-                            if not audio_b64:
-                                continue
-                            await outbound_queue.put(audio_b64)
+                            if audio_b64:
+                                await outbound_queue.put(audio_b64)
 
                 except Exception as e:
                     print(f"⚠️ [OpenAI→Twilio] Error: {e}")
 
             await asyncio.gather(twilio_to_openai(), openai_to_twilio())
 
-            # Cerrar emisor ritmado
             if not sender_task.done():
                 sender_task.cancel()
                 try:
@@ -373,7 +382,6 @@ async def media_socket(websocket: WebSocket):
 # ===== Debug mínimo =====
 @app.get("/whoami")
 async def whoami(request: Request):
-    # Devuelve el bot que se resolvería para esta petición (útil para pruebas)
     slug = None
     if ALLOW_QUERY_OVERRIDE:
         q = dict(request.query_params)
