@@ -47,7 +47,7 @@ async def twiml_webhook(request: Request, bot: str = Query(...)):
     except Exception:
         return PlainTextResponse("Bot no encontrado", status_code=404)
 
-    # --- Construir sesión efímera antes del Stream ---
+    # --- Crear sesión efímera ---
     model = cfg.get("model", DEFAULT_MODEL)
     voice = cfg.get("voice", DEFAULT_VOICE)
     instructions = cfg.get("instructions", "")
@@ -77,12 +77,17 @@ async def twiml_webhook(request: Request, bot: str = Query(...)):
         r.raise_for_status()
         data = r.json()
         ephemeral_token = data["client_secret"]["value"]
+
+        # ⚠️ Codificar el token para URL
+        import urllib.parse
+        token_safe = urllib.parse.quote(ephemeral_token, safe='')
         print(f"🔑 Sesión efímera creada para bot={bot}")
+
     except Exception as e:
         print("❌ Error creando sesión efímera:", e)
         return PlainTextResponse("Error al crear sesión efímera", status_code=500)
 
-    # --- Construir TwiML con token ya incluido ---
+    # --- Generar TwiML con token codificado ---
     host = request.url.hostname or "inhouston-ai-api.onrender.com"
     greeting = cfg.get("greeting", "Hola, soy tu asistente de In Houston Texas.")
     twilio_voice = cfg.get("twilio", {}).get("voice", "Polly.Lucia-Neural")
@@ -92,10 +97,11 @@ async def twiml_webhook(request: Request, bot: str = Query(...)):
 <Response>
   <Say voice="{twilio_voice}" language="{twilio_lang}">{greeting}</Say>
   <Connect>
-    <Stream url="wss://{host}/media?bot={bot}&token={ephemeral_token}" />
+    <Stream url="wss://{host}/media?bot={bot}&token={token_safe}" />
   </Connect>
 </Response>"""
     return Response(content=xml.strip(), media_type="application/xml")
+
 
 # ============================================================
 # MEDIA SOCKET: CONEXIÓN TWILIO ↔ OPENAI (USA TOKEN RECIBIDO)
