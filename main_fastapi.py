@@ -1,15 +1,10 @@
-# main_fastapi.py
-# Versión multibot Twilio ↔ OpenAI Realtime (oct 2025)
-# - μ-law 8 kHz end-to-end (sin resampling)
-# - VAD de servidor (turn_detection) en OpenAI
-# - Ritmo 20 ms hacia Twilio para audio estable
-# - MATRIZ: saludo, instrucciones, voz y temperatura vienen del JSON en bots/<slug>.json
+# main_fastapi.py — Multibot Twilio ↔ OpenAI Realtime (Oct 2025)
+# - Un teléfono = un bot (estricto opcional)
+# - Lee voz/temperatura/saludo/prompt/modelo desde bots/<slug>.json
+# - μ-law 8 kHz end-to-end, VAD server y pacing ~20 ms
+# - Logs de diagnóstico: ruta del JSON y resumen de claves
 
-import os
-import json
-import base64
-import asyncio
-import websockets
+import os, json, base64, asyncio, websockets
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -22,24 +17,25 @@ from starlette.websockets import WebSocketState
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PORT = int(os.getenv("PORT", "8080"))
 
-# Carpeta de bots y fallback
-BOTS_DIR = Path(os.getenv("BOTS_DIR", "bots"))
-DEFAULT_BOT = os.getenv("DEFAULT_BOT", "sundin")
+# Carpeta con los JSON de bots (relativa a la raíz del repo en Render)
+BOTS_DIR = Path(os.getenv("BOTS_DIR", "bots")).resolve()
 
-# Mapa opcional: número de destino (To) → slug de bot
-# Ejemplo env:
-#   TWILIO_BOT_MAP={"+" "17862237089":"sundin","+18323790809":"ventas"}
-# (sin el espacio entre + y " — lo agrego aquí solo para que no rompa formato)
-_TWILIO_BOT_MAP_RAW = os.getenv("TWILIO_BOT_MAP", "{}")
+# Enrutado por número: { "+18326213202": "sundin", ... }
 try:
-    TWILIO_BOT_MAP: Dict[str, str] = json.loads(_TWILIO_BOT_MAP_RAW)
+    TWILIO_BOT_MAP: Dict[str, str] = json.loads(os.getenv("TWILIO_BOT_MAP", "{}"))
 except Exception:
     TWILIO_BOT_MAP = {}
 
-print(f"🧩 Using PORT: {PORT}")
-print(f"🧩 BOTS_DIR: {BOTS_DIR.resolve()}")
-print(f"🧩 DEFAULT_BOT: {DEFAULT_BOT}")
+# Estricto: si el número no está en el mapa y no hay ?bot= → cuelga (sin fallback)
+ROUTING_STRICT = os.getenv("ROUTING_STRICT", "1").lower() in ("1", "true", "yes")
+
+# Permitir forzar bot con query ?bot= (útil en pruebas)
+ALLOW_QUERY_OVERRIDE = os.getenv("ALLOW_QUERY_OVERRIDE", "1").lower() in ("1", "true", "yes")
+
+print(f"🧩 BASE DIR: {Path.cwd()}")
+print(f"🧩 BOTS_DIR: {BOTS_DIR} (exists={BOTS_DIR.exists()})")
 print(f"🧩 TWILIO_BOT_MAP: {TWILIO_BOT_MAP}")
+print(f"🧩 ROUTING_STRICT={ROUTING_STRICT}  ALLOW_QUERY_OVERRIDE={ALLOW_QUERY_OVERRIDE}")
 
 app = FastAPI(title="In Houston AI — Twilio Realtime Bridge (Multibot)")
 
@@ -61,86 +57,116 @@ def ulaw_silence_b64(ms: int = 20) -> str:
 # ===== Utilidades de bots (JSON) =====
 _JSON_CACHE: Dict[str, Dict[str, Any]] = {}
 
-def _load_bot_json(slug: str) -> Dict[str, Any]:
+def _load_bot_json(slug: str) -> Optional[Dict[str, Any]]:
     """
-    Carga bots/<slug>.json. Si falla, intenta DEFAULT_BOT.
-    Estructura esperada mínima:
-      {
-        "system_prompt": "texto...",
-        "first_message": "Hola, soy ... ¿en qué te ayudo?",
-        "voice": "alloy",
-        "temperature": 0.8
-      }
+    Carga bots/<slug>.json desde BOTS_DIR.
+    Acepta alias: greeting->first_message, instructions->system_prompt.
+    Imprime ruta y resumen para diagnóstico.
     """
-    slug = (slug or "").strip().lower() or DEFAULT_BOT
+    slug = (slug or "").strip().lower()
+    if not slug:
+        print("❌ [CFG] slug vacío")
+        return None
     if slug in _JSON_CACHE:
         return _JSON_CACHE[slug]
 
-    def read_json(s: str) -> Optional[Dict[str, Any]]:
-        path = BOTS_DIR / f"{s}.json"
-        if not path.exists():
-            return None
+    path = BOTS_DIR / f"{slug}.json"
+    print(f"🔎 [CFG] Intentando cargar: {path.resolve()}")
+    if not path.exists():
+        print(f"❌ [CFG] NO existe: {path.resolve()}")
+        return None
+
+    try:
         with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
+    except Exception as e:
+        print(f"❌ [CFG] JSON inválido en {path.resolve()}: {e}")
+        return None
 
-    cfg = read_json(slug)
-    if cfg is None and slug != DEFAULT_BOT:
-        cfg = read_json(DEFAULT_BOT)
+    # Alias de compatibilidad
+    if "first_message" not in cfg and "greeting" in cfg:
+        cfg["first_message"] = cfg.get("greeting")
+    if "system_prompt" not in cfg and "instructions" in cfg:
+        cfg["system_prompt"] = cfg.get("instructions")
 
-    if cfg is None:
-        # Último recurso: configuración muy básica inline
-        cfg = {
-            "system_prompt": (
-                "Eres el asistente de voz de In Houston Texas. "
-                "Hablas en español latino, cálido y profesional. "
-                "Respondes breve, haces preguntas claras y ayudas a agendar citas."
-            ),
-            "first_message": "Hola, soy el asistente de In Houston Texas. ¿En qué te ayudo?",
-            "voice": "alloy",
-            "temperature": 0.8,
-        }
-
-    # Normalización de claves
+    # Defaults razonables
     cfg.setdefault("voice", "alloy")
     cfg.setdefault("temperature", 0.8)
+    cfg.setdefault("first_message", "")
     cfg.setdefault("system_prompt", "")
+    cfg.setdefault("model", "gpt-4o-realtime-preview")
+
+    # Log de resumen (80 chars máx)
+    fm = (cfg.get("first_message") or "")[:80]
+    sp = (cfg.get("system_prompt") or "")[:80]
+    print(f"✅ [CFG] Cargado {slug}.json | voice={cfg.get('voice')} temp={cfg.get('temperature')} model={cfg.get('model')}")
+    print(f"📝 [CFG] first_message: {fm!r}")
+    print(f"📝 [CFG] system_prompt: {sp!r}")
+
     _JSON_CACHE[slug] = cfg
     return cfg
 
-async def _resolve_bot_slug_from_twilio(request: Request) -> str:
+async def _resolve_bot_slug_from_twilio(request: Request) -> Optional[str]:
     """
     Prioridad:
-      1) query ?bot=slug
+      1) query ?bot=slug (si ALLOW_QUERY_OVERRIDE=1)
       2) map por número To (TWILIO_BOT_MAP)
-      3) DEFAULT_BOT
+      3) si ROUTING_STRICT=1 → None (mensaje y cuelga), si no → None (sin usar)
     """
     # 1) query
-    q = dict(request.query_params)
-    if "bot" in q and q["bot"].strip():
-        return q["bot"].strip().lower()
+    if ALLOW_QUERY_OVERRIDE:
+        q = dict(request.query_params)
+        if "bot" in q and q["bot"].strip():
+            return q["bot"].strip().lower()
 
     # 2) cuerpo Twilio (form-urlencoded)
     try:
         form = await request.form()
         to_number = (form.get("To") or form.get("Called") or "").strip()
+        if to_number:
+            print(f"☎️  [Twilio] To={to_number}")
         if to_number and to_number in TWILIO_BOT_MAP:
             return TWILIO_BOT_MAP[to_number].strip().lower()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ [Twilio] No se pudo leer form: {e}")
 
-    # 3) fallback
-    return DEFAULT_BOT
+    # 3) estricto → None (para devolver TwiML de error)
+    return None
 
 # ===== Health =====
 @app.get("/")
 async def root():
-    return PlainTextResponse("✅ In Houston AI — FastAPI multibot listo para Twilio Realtime")
+    return PlainTextResponse("✅ In Houston AI — FastAPI multibot (Strict-ready) listo para Twilio Realtime")
 
 # ===== TwiML (recibe la llamada y conecta Media Stream) =====
 @app.post("/twiml")
 async def twiml_webhook(request: Request):
     host = request.url.hostname or "inhouston-ai-api.onrender.com"
     slug = await _resolve_bot_slug_from_twilio(request)
+
+    if not slug:
+        if ROUTING_STRICT:
+            # Enrutado estricto: número no mapeado → mensaje y cuelga
+            xml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="es-MX">Este número no está configurado para un bot. Contacte al administrador.</Say>
+  <Hangup/>
+</Response>"""
+            return Response(content=xml.strip(), media_type="application/xml")
+        else:
+            # Modo no estricto: usa un fallback "demo"
+            slug = "default"
+
+    # Cargar JSON aquí para fallar pronto si no existe
+    cfg = _load_bot_json(slug)
+    if not cfg:
+        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="es-MX">No se encontró configuración para el bot {slug}. Revise la carpeta de bots.</Say>
+  <Hangup/>
+</Response>"""
+        return Response(content=xml.strip(), media_type="application/xml")
+
     # Pasamos el slug a /media por query
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -161,19 +187,24 @@ async def media_socket(websocket: WebSocket):
         await websocket.close()
         return
 
-    # Resolvemos el bot por query param en el WS
+    # Resolvemos el bot por query param en el WS (viene de /twiml)
     q = dict(websocket.query_params)
-    bot_slug = (q.get("bot") or DEFAULT_BOT).strip().lower()
+    bot_slug = (q.get("bot") or "").strip().lower()
     cfg = _load_bot_json(bot_slug)
+    if not cfg:
+        print(f"❌ Bot JSON no encontrado para slug={bot_slug}")
+        await websocket.close()
+        return
 
     voice = cfg.get("voice", "alloy")
-    temperature = cfg.get("temperature", 0.8)
-    system_prompt = cfg.get("system_prompt", "").strip()
+    temperature = float(cfg.get("temperature", 0.8))
+    system_prompt = (cfg.get("system_prompt") or "").strip()
     first_message = (cfg.get("first_message") or "").strip()
+    model = (cfg.get("model") or "gpt-4o-realtime-preview").strip()
 
-    print(f"🤖 [BOT] slug={bot_slug} voice={voice} temp={temperature}")
+    print(f"🤖 [BOT] slug={bot_slug} voice={voice} temp={temperature} model={model}")
 
-    realtime_uri = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+    realtime_uri = f"wss://api.openai.com/v1/realtime?model={model}"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "OpenAI-Beta": "realtime=v1",
@@ -246,13 +277,11 @@ async def media_socket(websocket: WebSocket):
 
             # (Opcional) Saludo inicial controlado por JSON:
             if first_message:
-                # Forzamos primer mensaje con 'instructions' de la respuesta
                 await openai_ws.send(json.dumps({
                     "type": "response.create",
                     "response": {"instructions": first_message}
                 }))
             else:
-                # Si no hay first_message, pedimos respuesta estándar (según system_prompt)
                 await openai_ws.send(json.dumps({"type": "response.create"}))
 
             # Lanzamos el emisor ritmado hacia Twilio
@@ -278,9 +307,6 @@ async def media_socket(websocket: WebSocket):
                                 "type": "input_audio_buffer.append",
                                 "audio": ulaw_b64  # g711_ulaw base64
                             }))
-
-                        elif ev == "mark":
-                            pass
 
                         elif ev == "stop":
                             print("🛑 [Twilio] stream STOP (fin de la llamada)")
@@ -344,11 +370,15 @@ async def media_socket(websocket: WebSocket):
     finally:
         print("🔴 [Twilio] WebSocket CLOSED")
 
-# ===== Local debug =====
+# ===== Debug mínimo =====
 @app.get("/whoami")
 async def whoami(request: Request):
-    # Pequeña ayuda para ver qué bot se resolvería por esta petición
-    slug = await _resolve_bot_slug_from_twilio(request)
+    # Devuelve el bot que se resolvería para esta petición (útil para pruebas)
+    slug = None
+    if ALLOW_QUERY_OVERRIDE:
+        q = dict(request.query_params)
+        if "bot" in q and q["bot"].strip():
+            slug = q["bot"].strip().lower()
     return {"bot": slug}
 
 if __name__ == "__main__":
