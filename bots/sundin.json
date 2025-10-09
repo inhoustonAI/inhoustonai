@@ -1,6 +1,6 @@
 {
   "voice": "marin",
-  "temperature": 0.85,
+  "temperature": 0.9,
   "model": "gpt-4o-realtime-preview-2024-12-17",
 
   "modalities": ["text", "audio"],
@@ -19,7 +19,7 @@
 
   "vad": {
     "type": "server_vad",
-    "silence_ms": 750,
+    "silence_ms": 1100,
     "prefix_ms": 60
   },
 
