@@ -97,14 +97,27 @@ def ulaw_silence_b64(ms: int = 20) -> str:
 # ======================================================
 @app.websocket("/media")
 async def media_socket(websocket: WebSocket):
+    # Obtener el nombre del bot
     bot = websocket.query_params.get("bot")
+
+    # Si no viene como query, intentar extraerlo del header Twilio
     if not bot:
-        print("❌ Conexión rechazada: falta parámetro ?bot=")
+        try:
+            headers = dict(websocket.headers)
+            stream_name = headers.get("x-twilio-stream-name", "")
+            if "?" in stream_name and "bot=" in stream_name:
+                bot = stream_name.split("bot=")[1].split("&")[0]
+        except Exception:
+            pass
+
+    if not bot:
+        print("❌ Conexión rechazada: Twilio no envió ?bot= ni header con bot=")
         await websocket.close(code=403)
         return
 
     await websocket.accept()
-    print(f"🟢 [Twilio] Conexión WS iniciada para bot={bot}")
+    print(f"🟢 [Twilio] Conexión WS iniciada correctamente para bot={bot}")
+
 
 
     # Configuración dinámica según el bot
