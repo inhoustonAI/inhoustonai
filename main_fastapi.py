@@ -208,12 +208,22 @@ async def media_socket(websocket: WebSocket):
     # Cola de salida para Twilio (μ-law b64) y emisor ritmado (20 ms)
     outbound_queue: asyncio.Queue[str] = asyncio.Queue()
 
-    # ---- Estado de conversación para barge-in y latencia baja ----
+    # ---- Estado de conversación para barge-in, métricas y latencia baja ----
     speaking_out = False        # True mientras el bot está emitiendo TTS
     barge_cancel_sent = False   # evita enviar cancel más de una vez por respuesta
     last_tts_ts = 0.0           # timestamp del último frame TTS enviado
     last_audio_rx_ts = 0.0      # timestamp del último frame de audio ENTRANTE (usuario)
     pending_audio_since = 0.0   # primer instante en que recibimos audio de usuario no comiteado
+
+    # NUEVO: contadores y umbrales para evitar commits vacíos y barge-in falso
+    USER_FRAME_MS = 20                 # Twilio Media Streams → ~20 ms por frame μ-law
+    user_ms_since_last_commit = 0      # audio acumulado desde el último commit
+    user_ms_while_bot_talking = 0      # audio del usuario que coincidió con TTS (para barge-in)
+
+    BARGE_MIN_USER_MS = 120            # ms mínimos de voz del usuario para cancelar TTS
+    COMMIT_MIN_MS = 120                # ms mínimos para poder commit sin error de buffer vacío
+    FORCED_COMMIT_INACT_MS = 0.8       # s de inactividad desde que empezó input antes de forzar
+    FORCED_COMMIT_GAP_MS = 0.6         # s de gap sin frames para forzar
 
     async def _twilio_send_ulaw_b64(ulaw_b64: str):
         """Envía un frame μ-law a Twilio (con streamSid si está disponible)."""
@@ -247,26 +257,37 @@ async def media_socket(websocket: WebSocket):
     async def forced_committer(openai_ws):
         """
         Si hubo audio de usuario y pasan umbrales sin speech_stopped,
-        forzamos commit para reducir latencia percibida.
+        forzamos commit para reducir latencia percibida, PERO solo si el buffer supera COMMIT_MIN_MS.
         """
-        nonlocal pending_audio_since
+        nonlocal pending_audio_since, last_audio_rx_ts, user_ms_since_last_commit
         try:
             while websocket.application_state == WebSocketState.CONNECTED:
                 await asyncio.sleep(0.2)
+                now = time.time()
 
-                # 1) Inactividad desde que empezó el input del usuario (0.8s)
-                if pending_audio_since and (time.time() - pending_audio_since) >= 0.8:
-                    print("⏱️ [Force] commit por inactividad VAD (0.8s)")
-                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    await openai_ws.send(json.dumps({"type": "response.create"}))
-                    pending_audio_since = 0.0
+                # 1) Inactividad desde que empezó el input del usuario
+                if pending_audio_since and (now - pending_audio_since) >= FORCED_COMMIT_INACT_MS:
+                    if user_ms_since_last_commit >= COMMIT_MIN_MS:
+                        print(f"⏱️ [Force] commit por inactividad VAD ({FORCED_COMMIT_INACT_MS}s)")
+                        await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                        user_ms_since_last_commit = 0
+                        pending_audio_since = 0.0
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                    else:
+                        # No hay suficiente audio; rearmamos reloj para no spamear commits vacíos
+                        pending_audio_since = now
 
-                # 2) Gap sin recibir audio (0.6s) desde el último frame entrante
-                if last_audio_rx_ts and (time.time() - last_audio_rx_ts) >= 0.6 and pending_audio_since:
-                    print("⏱️ [Force] commit por gap de audio (0.6s)")
-                    await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                    await openai_ws.send(json.dumps({"type": "response.create"}))
-                    pending_audio_since = 0.0
+                # 2) Gap sin recibir audio entrante
+                if last_audio_rx_ts and (now - last_audio_rx_ts) >= FORCED_COMMIT_GAP_MS and pending_audio_since:
+                    if user_ms_since_last_commit >= COMMIT_MIN_MS:
+                        print(f"⏱️ [Force] commit por gap de audio ({FORCED_COMMIT_GAP_MS}s)")
+                        await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                        user_ms_since_last_commit = 0
+                        pending_audio_since = 0.0
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                    else:
+                        # Gap pero sin suficiente audio: limpia estado para evitar commits vacíos
+                        pending_audio_since = 0.0
         except Exception as e:
             print(f"⚠️ [forced_committer] {e}")
 
@@ -323,7 +344,9 @@ async def media_socket(websocket: WebSocket):
 
             # ---- Twilio -> OpenAI (μ-law directo) ----
             async def twilio_to_openai():
-                nonlocal stream_sid, last_audio_rx_ts, pending_audio_since, speaking_out, barge_cancel_sent
+                nonlocal stream_sid, last_audio_rx_ts, pending_audio_since
+                nonlocal speaking_out, barge_cancel_sent
+                nonlocal user_ms_since_last_commit, user_ms_while_bot_talking
                 try:
                     while True:
                         msg_txt = await websocket.receive_text()
@@ -338,10 +361,16 @@ async def media_socket(websocket: WebSocket):
                             # μ-law base64 tal cual hacia OpenAI
                             ulaw_b64 = data["media"]["payload"]
 
-                            # --------- BAR­GE-IN: si el bot habla y el usuario entra, cortamos ---------
-                            if speaking_out and not barge_cancel_sent:
+                            # --- contabilizar audio entrante ---
+                            last_audio_rx_ts = time.time()
+                            user_ms_since_last_commit += USER_FRAME_MS
+                            if speaking_out:
+                                user_ms_while_bot_talking += USER_FRAME_MS
+
+                            # --------- BAR­GE-IN con debounce (≥120 ms) ---------
+                            if speaking_out and not barge_cancel_sent and user_ms_while_bot_talking >= BARGE_MIN_USER_MS:
                                 try:
-                                    print("🛑 [BARGE-IN] user speaking → response.cancel + flush queue")
+                                    print("🛑 [BARGE-IN] user speaking ≥120ms → response.cancel + flush queue")
                                     # 1) Cancelar respuesta en curso
                                     await openai_ws.send(json.dumps({"type": "response.cancel"}))
                                     barge_cancel_sent = True
@@ -352,8 +381,9 @@ async def media_socket(websocket: WebSocket):
                                             outbound_queue.task_done()
                                     except asyncio.QueueEmpty:
                                         pass
-                                    # 3) Marcar que ya no estamos “hablando”
+                                    # 3) Estados
                                     speaking_out = False
+                                    user_ms_while_bot_talking = 0
                                 except Exception as e:
                                     print(f"⚠️ [BARGE-IN] fallo al cancelar: {e}")
 
@@ -362,7 +392,7 @@ async def media_socket(websocket: WebSocket):
                                 "type": "input_audio_buffer.append",
                                 "audio": ulaw_b64  # g711_ulaw base64
                             }))
-                            last_audio_rx_ts = time.time()
+
                             if not pending_audio_since:
                                 pending_audio_since = last_audio_rx_ts
 
@@ -392,6 +422,7 @@ async def media_socket(websocket: WebSocket):
             # ---- OpenAI -> Twilio ----
             async def openai_to_twilio():
                 nonlocal speaking_out, barge_cancel_sent
+                nonlocal user_ms_since_last_commit, user_ms_while_bot_talking, pending_audio_since
                 try:
                     async for raw in openai_ws:
                         try:
@@ -415,13 +446,16 @@ async def media_socket(websocket: WebSocket):
                         ):
                             print(f"ℹ️ [OpenAI] {t}")
 
-                        # Al detectar fin de habla: commit + pedir respuesta
+                        # Fin de habla detectado por el VAD del modelo
                         if t == "input_audio_buffer.speech_stopped":
                             print("✂️  [OpenAI] speech_stopped → commit + response.create")
-                            # Reset de barge y estado de input
-                            await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                            await openai_ws.send(json.dumps({"type": "response.create"}))
-                            # Nota: pending_audio_since se resetea en forced_committer tras el commit
+                            if user_ms_since_last_commit >= COMMIT_MIN_MS:
+                                await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                                user_ms_since_last_commit = 0
+                                pending_audio_since = 0.0
+                                await openai_ws.send(json.dumps({"type": "response.create"}))
+                            else:
+                                print(f"ℹ️ [Guard] speech_stopped con buffer < {COMMIT_MIN_MS}ms; no commit")
 
                         # Audio saliente (nombres varían entre previews)
                         if t in ("response.audio.delta", "response.output_audio.delta"):
@@ -429,15 +463,14 @@ async def media_socket(websocket: WebSocket):
                             if not audio_b64:
                                 continue
                             speaking_out = True
-                            # apuntamos tiempo del último TTS
-                            # (para diagnóstico si hiciera falta)
-                            # last_tts_ts = time.time()  # ya definido si quieres usarlo luego
+                            last_tts_ts = time.time()
                             await outbound_queue.put(audio_b64)
 
-                        # Fin de item/respuesta → dejar de "hablar"
+                        # Fin de item/respuesta → dejar de "hablar" y resetear barge
                         if t in ("response.output_item.done", "response.done"):
                             speaking_out = False
                             barge_cancel_sent = False
+                            user_ms_while_bot_talking = 0  # ya no solapa
 
                 except Exception as e:
                     print(f"⚠️ [OpenAI→Twilio] Error: {e}")
