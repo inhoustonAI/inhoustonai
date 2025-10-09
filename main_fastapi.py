@@ -96,17 +96,16 @@ def ulaw_silence_b64(ms: int = 20) -> str:
 # 🔹 WEBSOCKET PRINCIPAL — CONEXIÓN TWILIO <-> OPENAI
 # ======================================================
 @app.websocket("/media")
-async def media_socket(websocket: WebSocket, bot: str):
+async def media_socket(websocket: WebSocket):
+    bot = websocket.query_params.get("bot")
+    if not bot:
+        print("❌ Conexión rechazada: falta parámetro ?bot=")
+        await websocket.close(code=403)
+        return
+
     await websocket.accept()
     print(f"🟢 [Twilio] Conexión WS iniciada para bot={bot}")
 
-    # Cargar configuración del bot
-    try:
-        cfg = load_bot_config(bot)
-    except Exception as e:
-        print(f"❌ No se pudo cargar {bot}.json: {e}")
-        await websocket.close()
-        return
 
     # Configuración dinámica según el bot
     model = cfg.get("model", "gpt-4o-realtime-preview")
