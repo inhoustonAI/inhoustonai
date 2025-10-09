@@ -11,7 +11,7 @@
   "locale": "es-US",
   "timezone": "America/Chicago",
 
-  "voice": "alloy",
+  "voice": "cedar",
   "temperature": 0.8,
 
   "first_message": "Hola, soy Sundin, el asistente principal de In Houston Texas. ¿En qué puedo ayudarte hoy?",
