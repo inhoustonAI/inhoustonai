@@ -1,386 +1,234 @@
-# main_fastapi.py — MEI (Matriz por JSON) para Twilio Media Streams ↔ OpenAI Realtime
-# - TODO sale de bots/<slug>.json (voz, modelo, prompt, VAD, formatos, saludo opcional, idiomas).
-# - Rutas: /twiml, /outgoing-call (TwiML), /media-stream (WS), /whoami (debug).
-# - Barge-in real: cancelar TTS + limpiar buffer en Twilio con {"event":"clear","streamSid":...}.
-# - Audio g711_ulaw 8 kHz end-to-end con pacing 20 ms.
-# - Idiomas: languages.allowed/default/auto_switch → inyectados a instructions.
-# - Saludo inicial EXACTO: desactivamos create_response al inicio, enviamos first_message literal, reactivamos luego.
+# -*- coding: utf-8 -*-
+"""
+Main FastAPI para base multi-agentes (Twilio + ElevenLabs)
+- /health                    -> estado del servicio
+- /bots                      -> lista de bots cargados desde ./bots/*.json
+- POST /twilio/sms           -> webhook SMS/WhatsApp (Twilio)
+- POST /twilio/voice         -> webhook Voice (Twilio, <Play> a /tts)
+- GET  /tts?text=...         -> genera MP3 con ElevenLabs (audio/mpeg)
 
-import os, json, base64, asyncio, websockets
-from pathlib import Path
-from typing import Optional, Dict, Any
+Listo para correr con uvicorn o gunicorn+uvicorn workers.
+"""
+import json
+import os
+import pathlib
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, Request, HTTPException
-from fastapi.responses import HTMLResponse, Response
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.websockets import WebSocketState, WebSocketDisconnect
+import requests
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-# ================== ENV ==================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-PORT = int(os.getenv("PORT", "5050"))
-BOTS_DIR = Path(os.getenv("BOTS_DIR", "bots"))
-DEFAULT_BOT = os.getenv("DEFAULT_BOT", "sundin")  # solo decide QUÉ JSON cargar si no llega ?bot=
-TWILIO_BOT_MAP: Dict[str, str] = {}
-try:
-    TWILIO_BOT_MAP = json.loads(os.getenv("TWILIO_BOT_MAP", "{}"))
-except Exception:
-    TWILIO_BOT_MAP = {}
+# Twilio TwiML helpers (no necesitas el client para responder webhooks)
+from twilio.twiml.messaging_response import MessagingResponse
+from twilio.twiml.voice_response import VoiceResponse
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY es obligatorio")
+# -----------------------------
+# Configuración y utilidades
+# -----------------------------
+ROOT_DIR = pathlib.Path(__file__).resolve().parent
+load_dotenv(dotenv_path=ROOT_DIR / ".env")  # si existe .env en el root
 
-# ================== APP ==================
-app = FastAPI(title="MEI — Twilio MediaStreams ↔ OpenAI Realtime (JSON Matrix)")
+FLASK_ENV = os.getenv("FLASK_ENV", "development")  # mantenemos la var por compat.
+PORT = int(os.getenv("PORT", "5000"))
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
+# Twilio
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")
+TWILIO_VOICE_FROM = os.getenv("TWILIO_VOICE_FROM", "")
 
-# ================== UTILS ==================
-def _ulaw_silence_b64(ms: int = 20) -> str:
-    """Frame de silencio μ-law 8k (0xFF). 20ms = 160 bytes."""
-    samples = 8_000 * ms // 1000
-    return base64.b64encode(b"\xFF" * samples).decode("utf-8")
+# ElevenLabs
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+DEFAULT_VOICE_ID = os.getenv("DEFAULT_VOICE_ID", "")
 
-def _strict_load_json(slug: str) -> Dict[str, Any]:
-    """Carga bots/<slug>.json y valida campos. Sin defaults mágicos."""
-    path = BOTS_DIR / f"{slug}.json"
-    if not path.exists():
-        raise HTTPException(400, f"Config no encontrada: bots/{slug}.json")
-    with path.open("r", encoding="utf-8") as f:
-        cfg = json.load(f)
+# Bots
+BOTS_DIR = os.getenv("BOTS_DIR", str(ROOT_DIR / "bots"))
 
-    # Requeridos
-    for k in ["voice", "temperature", "model", "system_prompt", "realtime"]:
-        if k not in cfg:
-            raise HTTPException(400, f"Falta '{k}' en bots/{slug}.json")
+def _load_bots(bots_dir: str) -> Dict[str, Dict[str, Any]]:
+    data: Dict[str, Dict[str, Any]] = {}
+    p = pathlib.Path(bots_dir)
+    if not p.is_dir():
+        return data
+    for f in p.glob("*.json"):
+        try:
+            with f.open("r", encoding="utf-8") as fh:
+                obj = json.load(fh)
+            bot_id = obj.get("id") or f.stem
+            data[bot_id] = obj
+        except Exception as e:
+            # No reventar por un JSON mal formado
+            print(f"[WARN] No se pudo cargar {f.name}: {e}")
+    return data
 
-    # Normalizar VAD
-    rt = cfg["realtime"] or {}
-    td = rt.get("turn_detection") or {}
-    if "silence_ms" in td and "silence_duration_ms" not in td:
-        td["silence_duration_ms"] = td.pop("silence_ms")
-    if "prefix_ms" in td and "prefix_padding_ms" not in td:
-        td["prefix_padding_ms"] = td.pop("prefix_ms")
-    td.setdefault("type", "server_vad")
-    td.setdefault("threshold", 0.5)             # sensibilidad moderada (ajustable en JSON)
-    td.setdefault("silence_duration_ms", 700)
-    td.setdefault("prefix_padding_ms", 150)
-    td.setdefault("create_response", True)      # server VAD crea respuesta (sin commit manual)
-    td.setdefault("interrupt_response", True)   # permite interrupción
-    rt["turn_detection"] = td
+BOTS_REGISTRY = _load_bots(BOTS_DIR)
 
-    # Formatos μ-law 8k (Twilio)
-    rt.setdefault("input_audio_format", "g711_ulaw")
-    rt.setdefault("output_audio_format", "g711_ulaw")
-    cfg["realtime"] = rt
+def reload_bots() -> None:
+    global BOTS_REGISTRY
+    BOTS_REGISTRY = _load_bots(BOTS_DIR)
 
-    return cfg
+def find_bot_by_number(number: str) -> Optional[Dict[str, Any]]:
+    """Busca el bot cuyo número (voice o whatsapp:+...) coincida con 'number'."""
+    if not number:
+        return None
+    n = str(number).strip().lower()
+    for bot in BOTS_REGISTRY.values():
+        nums = bot.get("phone_numbers", {})
+        voice = str(nums.get("voice", "")).lower()
+        wa = str(nums.get("whatsapp", "")).lower()
+        if n == voice or n == wa:
+            return bot
+    return None
 
-async def _resolve_slug(request: Request) -> str:
-    """Prioridad: ?bot=...  →  TWILIO_BOT_MAP por número  →  DEFAULT_BOT"""
-    qp = dict(request.query_params)
-    if qp.get("bot"):
-        return qp["bot"].strip().lower()
-    try:
-        form = await request.form()
-        to_number = (form.get("To") or form.get("Called") or "").strip()
-        if to_number and to_number in TWILIO_BOT_MAP:
-            return TWILIO_BOT_MAP[to_number].strip().lower()
-    except Exception:
-        pass
-    return DEFAULT_BOT
+def make_absolute_url(request: Request, path: str) -> str:
+    """
+    Twilio necesita URL absolutas en <Play>. Construimos base con host+proto.
+    """
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("host") or request.url.hostname
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{proto}://{host}{path}"
 
-# ================== ROUTES ==================
-@app.get("/", response_class=HTMLResponse)
-async def index_page():
-    return HTMLResponse("<h3>MEI Realtime listo</h3>")
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI(title="INH MultiAgents (FastAPI)")
 
-# (A) Ruta compatible con configuración Twilio existente
-@app.post("/twiml")
-async def twiml(request: Request):
-    host = request.url.hostname or "inhouston-ai-api.onrender.com"
-    slug = await _resolve_slug(request)
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="wss://{host}/media-stream?bot={slug}" />
-  </Connect>
-</Response>"""
-    return Response(xml.strip(), media_type="application/xml")
+# -----------------------------
+# Modelos
+# -----------------------------
+class TTSQuery(BaseModel):
+    text: str
+    voice_id: Optional[str] = None
+    model_id: Optional[str] = "eleven_turbo_v2"
 
-# (B) Alternativa /outgoing-call
-@app.api_route("/outgoing-call", methods=["GET","POST"])
-async def outgoing_call(request: Request):
-    host = request.url.hostname or "inhouston-ai-api.onrender.com"
-    slug = await _resolve_slug(request)
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="wss://{host}/media-stream?bot={slug}" />
-  </Connect>
-</Response>"""
-    return Response(xml.strip(), media_type="application/xml")
-
-# ================== CORE: Twilio WS <-> OpenAI Realtime ==================
-@app.websocket("/media-stream")
-async def media_stream(ws: WebSocket):
-    await ws.accept()
-    print("🟢 Twilio WS connected")
-
-    if not OPENAI_API_KEY:
-        await ws.close(); return
-
-    # --- Cargar JSON estricto ---
-    qp = dict(ws.query_params)
-    bot_slug = (qp.get("bot") or DEFAULT_BOT).strip().lower()
-    try:
-        cfg = _strict_load_json(bot_slug)
-    except HTTPException as e:
-        print("❌ JSON inválido:", e.detail)
-        await ws.close(); return
-
-    voice         = cfg["voice"]
-    temperature   = float(cfg["temperature"])
-    system_prompt = (cfg.get("system_prompt") or "").strip()
-    first_message = (cfg.get("first_message") or "").strip()  # opcional
-    model         = cfg["model"].strip()
-
-    rt       = cfg["realtime"]
-    in_fmt   = rt["input_audio_format"]      # g711_ulaw
-    out_fmt  = rt["output_audio_format"]     # g711_ulaw
-    turn_det = rt["turn_detection"]
-
-    # Idiomas desde JSON (allowed/default/auto_switch) → se inyectan en instructions
-    langs_cfg   = (cfg.get("languages") or {})
-    allowed     = langs_cfg.get("allowed") or ["es-US", "en-US"]
-    default_lng = langs_cfg.get("default") or "es-US"
-    auto_switch = bool(langs_cfg.get("auto_switch", True))
-    lang_clause = [
-        f"Idiomas permitidos: {', '.join(allowed)}.",
-        f"Idioma por defecto: {default_lng}.",
-        ("Cambia automáticamente al idioma del usuario si detectas otro de los permitidos."
-         if auto_switch else
-         "No cambies de idioma automáticamente; mantén el idioma por defecto salvo petición explícita del usuario.")
-    ]
-
-    # Instrucciones finales (prompt del JSON + reglas de idioma + anti-personalización del saludo)
-    merged_instructions = (system_prompt + " " + " ".join(lang_clause)).strip()
-    merged_instructions += (
-        " El primer enunciado DEBE ser exactamente el contenido de 'first_message' si existe; "
-        "no agregues ni quites palabras, no uses el nombre del cliente a menos que él mismo lo diga. "
-        "Nunca saludes con 'Hola, Sarah' ni variantes, porque 'Sara' es el nombre de la agente, no del cliente."
+# -----------------------------
+# Rutas básicas
+# -----------------------------
+@app.get("/health")
+def health() -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "ok",
+            "env": FLASK_ENV,
+            "bots_count": len(BOTS_REGISTRY),
+            "elevenlabs": bool(ELEVENLABS_API_KEY),
+        }
     )
 
-    print(f"🤖 bot={bot_slug} model={model} voice={voice}")
-    print(f"🗂️ first_message={'(none)' if not first_message else first_message[:100]!r}")
-    print(f"🎛️ realtime={rt}")
-    print(f"🌐 languages: allowed={allowed} default={default_lng} auto_switch={auto_switch}")
+@app.get("/bots")
+def list_bots() -> JSONResponse:
+    return JSONResponse({"bots": list(BOTS_REGISTRY.values())})
 
-    # --- Conectar a OpenAI Realtime ---
-    ai_url = f"wss://api.openai.com/v1/realtime?model={model}"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
+@app.post("/bots/reload")
+def bots_reload() -> JSONResponse:
+    reload_bots()
+    return JSONResponse({"reloaded": True, "bots_count": len(BOTS_REGISTRY)})
 
-    stream_sid: Optional[str] = None
-    user_speaking = False
-    out_q: asyncio.Queue[str] = asyncio.Queue()
+# -----------------------------
+# Webhooks Twilio (SMS/WhatsApp)
+# -----------------------------
+@app.post("/twilio/sms")
+async def twilio_sms(request: Request) -> Response:
+    form = await request.form()
+    from_number = str(form.get("From", "")).strip()
+    body = str(form.get("Body", "")).strip() or "Hola 👋"
+    bot = find_bot_by_number(from_number)
 
-    async def twilio_send_ulaw(b64: str):
-        if ws.application_state != WebSocketState.CONNECTED:
-            return
-        payload = {"event":"media","media":{"payload": b64}}
-        if stream_sid: payload["streamSid"] = stream_sid
-        try:
-            await ws.send_json(payload)
-        except Exception as e:
-            print("⚠️ send media fail:", e)
+    label = bot["display_name"] if bot and bot.get("display_name") else "Agente"
+    reply = f"[{label}] Recibido: {body}"
 
-    async def twilio_clear():
-        """Vacía el buffer de reproducción en Twilio (imprescindible para barge-in real)."""
-        if ws.application_state != WebSocketState.CONNECTED or not stream_sid:
-            return
-        try:
-            await ws.send_json({"event":"clear","streamSid":stream_sid})
-            print("🧹 Twilio buffer CLEAR enviado")
-        except Exception as e:
-            print("⚠️ clear fail:", e)
+    # Puedes enrutar por bot['prompt'] o NLU más adelante.
+    twiml = MessagingResponse()
+    twiml.message(reply)
+    xml = str(twiml)
+    return Response(content=xml, media_type="application/xml")
 
-    async def drain_out():
-        try:
-            while True:
-                out_q.get_nowait()
-                out_q.task_done()
-        except asyncio.QueueEmpty:
-            pass
+# -----------------------------
+# Webhook Twilio (Voice)
+# -----------------------------
+@app.post("/twilio/voice")
+async def twilio_voice(request: Request) -> Response:
+    form = await request.form()
+    from_number = str(form.get("From", "")).strip()
+    bot = find_bot_by_number(from_number)
 
-    async def paced_sender():
-        SIL = _ulaw_silence_b64(20)
-        while ws.application_state == WebSocketState.CONNECTED:
-            try:
-                if user_speaking:
-                    await twilio_send_ulaw(SIL); await asyncio.sleep(0.020); continue
-                chunk = await asyncio.wait_for(out_q.get(), timeout=0.060)
-                await twilio_send_ulaw(chunk); out_q.task_done()
-                await asyncio.sleep(0.020)
-            except asyncio.TimeoutError:
-                await twilio_send_ulaw(SIL)
+    # Texto base para TTS
+    display = bot["display_name"] if bot and bot.get("display_name") else "Agente"
+    prompt = (bot.get("prompt") if bot else None) or "Hola, ¿en qué puedo ayudarte?"
+    text = f"Hola, estás hablando con {display}. {prompt}"
 
+    # Si no hay API key de ElevenLabs, degradamos a <Say>
+    vr = VoiceResponse()
+    if not ELEVENLABS_API_KEY:
+        vr.say(text, language="es-ES")
+        return Response(content=str(vr), media_type="application/xml")
+
+    # Construimos URL absoluta a /tts
+    voice_id = ""
+    if bot and bot.get("elevenlabs", {}).get("voice_id"):
+        voice_id = bot["elevenlabs"]["voice_id"]
+    elif DEFAULT_VOICE_ID:
+        voice_id = DEFAULT_VOICE_ID
+
+    # Ojo: encode params vía query string
+    from urllib.parse import urlencode, quote_plus
+    qs = urlencode({"text": text, "voice_id": voice_id}, quote_via=quote_plus)
+    tts_url = make_absolute_url(request, f"/tts?{qs}")
+
+    # Twilio reproducirá el MP3 directamente
+    vr.play(tts_url)
+    return Response(content=str(vr), media_type="application/xml")
+
+# -----------------------------
+# TTS (ElevenLabs) -> MP3
+# -----------------------------
+def elevenlabs_tts_bytes(text: str, voice_id: str, model_id: str = "eleven_turbo_v2") -> bytes:
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError("Falta ELEVENLABS_API_KEY en el entorno")
+    if not voice_id:
+        raise RuntimeError("Falta voice_id (usa DEFAULT_VOICE_ID o define en el bot)")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "accept": "audio/mpeg",
+        "content-type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": model_id,
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.7},
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+@app.get("/tts")
+def tts_get(text: str, voice_id: Optional[str] = None, model_id: str = "eleven_turbo_v2"):
+    """Devuelve audio/mpeg para que Twilio <Play> lo consuma."""
+    v_id = voice_id or DEFAULT_VOICE_ID
     try:
-        async with websockets.connect(
-            ai_url, extra_headers=headers, subprotocols=["realtime"],
-            ping_interval=20, ping_timeout=20, close_timeout=5, max_size=10_000_000
-        ) as aiws:
-            print("🔗 OpenAI Realtime CONNECTED")
-
-            # ARRANQUE: si hay first_message, desactivar create_response para que NO se adelante el modelo
-            td_boot = dict(turn_det)
-            initial_greeting = bool(first_message)
-            if initial_greeting:
-                td_boot["create_response"] = False
-
-            # 1) session.update con instrucciones y td_boot (si aplica)
-            session_update = {
-                "type": "session.update",
-                "session": {
-                    "turn_detection": td_boot if initial_greeting else turn_det,
-                    "input_audio_format": in_fmt,
-                    "output_audio_format": out_fmt,
-                    "voice": voice,
-                    "modalities": ["audio","text"],
-                    "instructions": merged_instructions,
-                    "temperature": temperature
-                }
-            }
-            await aiws.send(json.dumps(session_update))
-            print("➡️ session.update enviado")
-
-            # 2) Saludo inicial literal (si existe)
-            initial_response_id = None
-            waiting_initial_done = initial_greeting
-
-            if first_message:
-                await aiws.send(json.dumps({
-                    "type": "response.create",
-                    "response": {
-                        "modalities": ["audio","text"],
-                        "voice": voice,
-                        "output_audio_format": out_fmt,
-                        "instructions": first_message
-                    }
-                }))
-
-            sender_task = asyncio.create_task(paced_sender())
-
-            # ---- Twilio → OpenAI ----
-            async def t2o():
-                nonlocal stream_sid
-                try:
-                    async for txt in ws.iter_text():
-                        data = json.loads(txt)
-                        ev = data.get("event")
-
-                        if ev == "start":
-                            stream_sid = data.get("start", {}).get("streamSid")
-                            print(f"🎧 Twilio START sid={stream_sid}")
-
-                        elif ev == "media":
-                            ulaw_b64 = data["media"]["payload"]
-                            await aiws.send(json.dumps({
-                                "type": "input_audio_buffer.append",
-                                "audio": ulaw_b64
-                            }))
-
-                        elif ev == "stop":
-                            print("🛑 Twilio STOP")
-                            try: await aiws.close()
-                            except Exception: pass
-                            break
-                except WebSocketDisconnect:
-                    print("🔴 Twilio WS disconnect")
-                    try: await aiws.close()
-                    except Exception: pass
-                except Exception as e:
-                    print("⚠️ Twilio→OpenAI error:", e)
-                    try: await aiws.close()
-                    except Exception: pass
-
-            # ---- OpenAI → Twilio ----
-            async def o2t():
-                nonlocal user_speaking, initial_response_id, waiting_initial_done
-                try:
-                    async for raw in aiws:
-                        try:
-                            evt = json.loads(raw)
-                        except Exception:
-                            continue
-
-                        t = evt.get("type")
-                        if t and t not in ("response.audio.delta","response.output_audio.delta",
-                                           "input_audio_buffer.speech_started","input_audio_buffer.speech_stopped"):
-                            print("ℹ️", t, "::", evt)
-
-                        if t == "error":
-                            print("❌ OpenAI ERROR:", evt)
-
-                        # Identificar el ID del saludo inicial
-                        if t == "response.created" and waiting_initial_done and initial_response_id is None:
-                            initial_response_id = (evt.get("response") or {}).get("id")
-
-                        # Cuando el saludo inicial termina -> reactivar create_response=True
-                        if t == "response.done" and waiting_initial_done:
-                            resp = evt.get("response") or {}
-                            if resp.get("id") == initial_response_id:
-                                new_td = dict(turn_det)
-                                new_td["create_response"] = True
-                                await aiws.send(json.dumps({
-                                    "type": "session.update",
-                                    "session": { "turn_detection": new_td }
-                                }))
-                                print("✅ VAD reactivado: create_response=True tras el saludo literal")
-                                waiting_initial_done = False
-
-                        if t == "input_audio_buffer.speech_started":
-                            user_speaking = True
-                            print("👂 speech_started → cancelar TTS y limpiar buffers")
-                            await aiws.send(json.dumps({"type":"response.cancel"}))
-                            await drain_out()
-                            await twilio_clear()
-
-                        if t == "input_audio_buffer.speech_stopped":
-                            user_speaking = False
-                            print("🗣️ speech_stopped (server VAD creará respuesta)")
-
-                        if t in ("response.audio.delta","response.output_audio.delta"):
-                            if user_speaking:
-                                continue
-                            audio_b64 = evt.get("delta") or evt.get("audio")
-                            if audio_b64:
-                                await out_q.put(audio_b64)
-                except Exception as e:
-                    print("⚠️ OpenAI→Twilio error:", e)
-
-            await asyncio.gather(t2o(), o2t())
-
-            if not sender_task.done():
-                sender_task.cancel()
-                try: await sender_task
-                except asyncio.CancelledError: pass
-
+        mp3 = elevenlabs_tts_bytes(text=text, voice_id=v_id, model_id=model_id)
     except Exception as e:
-        import traceback
-        print("❌ Conexión Realtime falló:", e)
-        traceback.print_exc()
-    finally:
-        print("🔴 Twilio WS CLOSED")
+        # Si algo falla, devolvemos texto plano para depurar rápido
+        return PlainTextResponse(f"TTS error: {e}", status_code=500)
+    return StreamingResponse(iter([mp3]), media_type="audio/mpeg")
 
-# ================== DEBUG ==================
-@app.get("/whoami")
-async def whoami(request: Request):
-    slug = await _resolve_slug(request)
-    return {"bot": slug}
+# -----------------------------
+# Raíz (útil para verificar despliegue)
+# -----------------------------
+@app.get("/")
+def root() -> JSONResponse:
+    return JSONResponse({"ok": True, "service": "INH MultiAgents (FastAPI)"})
 
+
+# -----------------------------
+# Punto de entrada local
+# -----------------------------
 if __name__ == "__main__":
+    # Ejecutar local: python main_fastapi.py
     import uvicorn
-    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=PORT, reload=True)
+    uvicorn.run("main_fastapi.py:app", host="0.0.0.0", port=PORT, reload=True)
