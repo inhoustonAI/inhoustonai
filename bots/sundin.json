@@ -2,8 +2,8 @@
   "id": "sundin",
   "display_name": "Sundin / In Houston AI",
   "phone_numbers": {
-    "voice": "+1XXXXXXXXXX",
-    "whatsapp": "whatsapp:+1YYYYYYYYYY"
+    "voice": "+18325512420",
+    "whatsapp": "whatsapp:+18325512420"
   },
   "email": {
     "to": ["ops@inhoustontexas.us", "sundin@inhoustontexas.us"],
@@ -12,8 +12,8 @@
   },
   "followups": {
     "send_link_url": "https://multi-bot-inteligente-v1.onrender.com/actions/send-link",
-    "bot": "whatsapp:+18326213202",
-    "channel": "sms",
+    "bot": "whatsapp:+18325512420",
+    "channel": "wa",
     "link": "https://calendly.com/houston-school/30min"
   },
   "elevenlabs": {
