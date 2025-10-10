@@ -4,7 +4,7 @@
 # - Barge-in real: cancelar TTS + limpiar buffer en Twilio con {"event":"clear","streamSid":...}.
 # - Audio g711_ulaw 8 kHz end-to-end con pacing 20 ms.
 # - Idiomas: languages.allowed/default/auto_switch → inyectados a instructions.
-# - Saludo inicial EXACTO: create_response=False al inicio + response.metadata={'is_first_message': true}, reactivar luego.
+# - Saludo inicial EXACTO: desactivamos create_response al inicio, enviamos first_message literal, reactivamos luego.
 
 import os, json, base64, asyncio, websockets
 from pathlib import Path
@@ -19,7 +19,7 @@ from starlette.websockets import WebSocketState, WebSocketDisconnect
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PORT = int(os.getenv("PORT", "5050"))
 BOTS_DIR = Path(os.getenv("BOTS_DIR", "bots"))
-DEFAULT_BOT = os.getenv("DEFAULT_BOT", "sundin")
+DEFAULT_BOT = os.getenv("DEFAULT_BOT", "sundin")  # solo decide QUÉ JSON cargar si no llega ?bot=
 TWILIO_BOT_MAP: Dict[str, str] = {}
 try:
     TWILIO_BOT_MAP = json.loads(os.getenv("TWILIO_BOT_MAP", "{}"))
@@ -65,11 +65,11 @@ def _strict_load_json(slug: str) -> Dict[str, Any]:
     if "prefix_ms" in td and "prefix_padding_ms" not in td:
         td["prefix_padding_ms"] = td.pop("prefix_ms")
     td.setdefault("type", "server_vad")
-    td.setdefault("threshold", 0.5)             # sensible pero estable (ajústalo en JSON si quieres)
+    td.setdefault("threshold", 0.5)             # sensibilidad moderada (ajustable en JSON)
     td.setdefault("silence_duration_ms", 700)
     td.setdefault("prefix_padding_ms", 150)
-    td.setdefault("create_response", True)      # lo apagamos temporalmente para el saludo
-    td.setdefault("interrupt_response", True)
+    td.setdefault("create_response", True)      # server VAD crea respuesta (sin commit manual)
+    td.setdefault("interrupt_response", True)   # permite interrupción
     rt["turn_detection"] = td
 
     # Formatos μ-law 8k (Twilio)
@@ -98,6 +98,7 @@ async def _resolve_slug(request: Request) -> str:
 async def index_page():
     return HTMLResponse("<h3>MEI Realtime listo</h3>")
 
+# (A) Ruta compatible con configuración Twilio existente
 @app.post("/twiml")
 async def twiml(request: Request):
     host = request.url.hostname or "inhouston-ai-api.onrender.com"
@@ -110,6 +111,7 @@ async def twiml(request: Request):
 </Response>"""
     return Response(xml.strip(), media_type="application/xml")
 
+# (B) Alternativa /outgoing-call
 @app.api_route("/outgoing-call", methods=["GET","POST"])
 async def outgoing_call(request: Request):
     host = request.url.hostname or "inhouston-ai-api.onrender.com"
@@ -143,7 +145,7 @@ async def media_stream(ws: WebSocket):
     voice         = cfg["voice"]
     temperature   = float(cfg["temperature"])
     system_prompt = (cfg.get("system_prompt") or "").strip()
-    first_message = (cfg.get("first_message") or "").strip()
+    first_message = (cfg.get("first_message") or "").strip()  # opcional
     model         = cfg["model"].strip()
 
     rt       = cfg["realtime"]
@@ -151,7 +153,7 @@ async def media_stream(ws: WebSocket):
     out_fmt  = rt["output_audio_format"]     # g711_ulaw
     turn_det = rt["turn_detection"]
 
-    # Idiomas desde JSON
+    # Idiomas desde JSON (allowed/default/auto_switch) → se inyectan en instructions
     langs_cfg   = (cfg.get("languages") or {})
     allowed     = langs_cfg.get("allowed") or ["es-US", "en-US"]
     default_lng = langs_cfg.get("default") or "es-US"
@@ -164,12 +166,12 @@ async def media_stream(ws: WebSocket):
          "No cambies de idioma automáticamente; mantén el idioma por defecto salvo petición explícita del usuario.")
     ]
 
-    # Instrucciones finales
+    # Instrucciones finales (prompt del JSON + reglas de idioma + anti-personalización del saludo)
     merged_instructions = (system_prompt + " " + " ".join(lang_clause)).strip()
     merged_instructions += (
         " El primer enunciado DEBE ser exactamente el contenido de 'first_message' si existe; "
         "no agregues ni quites palabras, no uses el nombre del cliente a menos que él mismo lo diga. "
-        "Nunca te dirijas al cliente como 'Sara' o 'Sarah'; 'Sara' es tu nombre (agente), no el del cliente."
+        "Nunca saludes con 'Hola, Sarah' ni variantes, porque 'Sara' es el nombre de la agente, no del cliente."
     )
 
     print(f"🤖 bot={bot_slug} model={model} voice={voice}")
@@ -196,6 +198,7 @@ async def media_stream(ws: WebSocket):
             print("⚠️ send media fail:", e)
 
     async def twilio_clear():
+        """Vacía el buffer de reproducción en Twilio (imprescindible para barge-in real)."""
         if ws.application_state != WebSocketState.CONNECTED or not stream_sid:
             return
         try:
@@ -231,15 +234,14 @@ async def media_stream(ws: WebSocket):
         ) as aiws:
             print("🔗 OpenAI Realtime CONNECTED")
 
-            # ====== BLOQUEO DE SALUDO INICIAL ======
-            # Si hay first_message, arrancar con create_response=False
+            # ARRANQUE: si hay first_message, desactivar create_response para que NO se adelante el modelo
             td_boot = dict(turn_det)
             initial_greeting = bool(first_message)
             if initial_greeting:
                 td_boot["create_response"] = False
 
-            # 1) session.update con instrucciones + td_boot
-            await aiws.send(json.dumps({
+            # 1) session.update con instrucciones y td_boot (si aplica)
+            session_update = {
                 "type": "session.update",
                 "session": {
                     "turn_detection": td_boot if initial_greeting else turn_det,
@@ -250,10 +252,11 @@ async def media_stream(ws: WebSocket):
                     "instructions": merged_instructions,
                     "temperature": temperature
                 }
-            }))
+            }
+            await aiws.send(json.dumps(session_update))
             print("➡️ session.update enviado")
 
-            # 2) Enviar el saludo inicial con metadata y solo reproducir ese response_id
+            # 2) Saludo inicial literal (si existe)
             initial_response_id = None
             waiting_initial_done = initial_greeting
 
@@ -264,8 +267,7 @@ async def media_stream(ws: WebSocket):
                         "modalities": ["audio","text"],
                         "voice": voice,
                         "output_audio_format": out_fmt,
-                        "instructions": first_message,
-                        "metadata": {"is_first_message": True}
+                        "instructions": first_message
                     }
                 }))
 
@@ -315,27 +317,19 @@ async def media_stream(ws: WebSocket):
                             continue
 
                         t = evt.get("type")
-
-                        # Logs útiles (sin inundar con deltas)
-                        if t and t not in (
-                            "response.audio.delta", "response.output_audio.delta",
-                            "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped"
-                        ):
+                        if t and t not in ("response.audio.delta","response.output_audio.delta",
+                                           "input_audio_buffer.speech_started","input_audio_buffer.speech_stopped"):
                             print("ℹ️", t, "::", evt)
 
                         if t == "error":
                             print("❌ OpenAI ERROR:", evt)
 
-                        # Capturar el ID del saludo (vía metadata)
+                        # Identificar el ID del saludo inicial
                         if t == "response.created" and waiting_initial_done and initial_response_id is None:
-                            resp = evt.get("response") or {}
-                            meta = resp.get("metadata") or {}
-                            if meta.get("is_first_message") is True:
-                                initial_response_id = resp.get("id")
-                                print(f"🔒 Bloqueando audio a response_id inicial: {initial_response_id}")
+                            initial_response_id = (evt.get("response") or {}).get("id")
 
-                        # Al terminar ese response → reactivar create_response
-                        if t == "response.done" and waiting_initial_done and initial_response_id:
+                        # Cuando el saludo inicial termina -> reactivar create_response=True
+                        if t == "response.done" and waiting_initial_done:
                             resp = evt.get("response") or {}
                             if resp.get("id") == initial_response_id:
                                 new_td = dict(turn_det)
@@ -344,7 +338,7 @@ async def media_stream(ws: WebSocket):
                                     "type": "session.update",
                                     "session": { "turn_detection": new_td }
                                 }))
-                                print("✅ VAD reactivado: create_response=True tras saludo literal")
+                                print("✅ VAD reactivado: create_response=True tras el saludo literal")
                                 waiting_initial_done = False
 
                         if t == "input_audio_buffer.speech_started":
@@ -358,14 +352,7 @@ async def media_stream(ws: WebSocket):
                             user_speaking = False
                             print("🗣️ speech_stopped (server VAD creará respuesta)")
 
-                        # Audio saliente del modelo:
-                        if t in ("response.audio.delta", "response.output_audio.delta"):
-                            # Si estamos en saludo inicial, solo aceptamos audio del response_id esperado
-                            if waiting_initial_done:
-                                resp_id = evt.get("response_id") or (evt.get("response") or {}).get("id")
-                                if not initial_response_id or resp_id != initial_response_id:
-                                    # Ignorar cualquier audio que no sea del saludo literal
-                                    continue
+                        if t in ("response.audio.delta","response.output_audio.delta"):
                             if user_speaking:
                                 continue
                             audio_b64 = evt.get("delta") or evt.get("audio")
