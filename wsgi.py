@@ -1,21 +1,5 @@
-# wsgi.py — punto de entrada principal para Render (modo ASGI)
-# Soporta Flask (WSGI) + FastAPI (ASGI) + WebSocket (Twilio Realtime)
-
-import logging
-from app import create_app
-
-# Crear la app combinada (Flask + FastAPI)
-asgi_app = create_app()
-
-# Configuración de logs detallada
-logging.basicConfig(level=logging.INFO)
-logging.getLogger("uvicorn").setLevel(logging.INFO)
-logging.getLogger("websockets").setLevel(logging.INFO)
-logging.getLogger("gunicorn").setLevel(logging.INFO)
-
-print("✅ FastAPI y Flask integrados con compatibilidad ASGI.")
-print("🟢 ASGI inicializado con soporte FastAPI + Flask")
-print("👉 Esperando conexión Twilio / multibot en /ws ...")
-
-# Render ejecuta automáticamente:
-# gunicorn -k uvicorn.workers.UvicornWorker wsgi:asgi_app
+# wsgi.py — (no usado en Render con startCommand=uvicorn ...)
+# Este archivo existe sólo para evitar errores si alguien intenta importarlo.
+# Render inicia con: uvicorn main_fastapi:app --host 0.0.0.0 --port $PORT
+asgi_app = None
+print("ℹ️ wsgi.py: no se usa; la app corre con Uvicorn (main_fastapi:app).")
