@@ -10,7 +10,12 @@ services:
         value: 3.11.9
       - key: OPENAI_API_KEY
         sync: false
+      # El modelo lo manda el JSON; este env es opcional:
       - key: OPENAI_REALTIME_MODEL
         value: gpt-4o-realtime-preview-2024-12-17
+      # 👇 Usa la ruta REAL del WS de la matriz MEI:
       - key: WS_PUBLIC_URL
-        value: wss://inhouston-ai-api.onrender.com/media
+        value: wss://inhouston-ai-api.onrender.com/media-stream
+      # (opcional) ruteo por número → slug
+      # - key: TWILIO_BOT_MAP
+      #   value: '{" +18326213202": "sundin" }'
