@@ -1,15 +1,17 @@
 # main_fastapi.py — MEI (Matriz por JSON) para Twilio Media Streams ↔ OpenAI Realtime
-# - TODO sale de bots/<slug>.json (voz, modelo, prompt, VAD, formatos, saludo opcional).
+# - TODO sale de bots/<slug>.json (voz, modelo, prompt, VAD, formatos, saludo opcional, idiomas).
 # - Rutas: /twiml, /outgoing-call (TwiML), /media-stream (WS), /whoami (debug).
 # - Barge-in real: cancelar TTS + limpiar buffer en Twilio con {"event":"clear","streamSid":...}.
 # - Audio g711_ulaw 8 kHz end-to-end con pacing 20 ms.
+# - Idiomas: languages.allowed/default/auto_switch → inyectados a instructions.
+# - Saludo inicial EXACTO: desactivamos create_response al inicio, enviamos first_message literal, reactivamos luego.
 
 import os, json, base64, asyncio, websockets
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, WebSocket, Request, HTTPException
-from fastapi.responses import HTMLResponse, Response, PlainTextResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState, WebSocketDisconnect
 
@@ -18,7 +20,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PORT = int(os.getenv("PORT", "5050"))
 BOTS_DIR = Path(os.getenv("BOTS_DIR", "bots"))
 DEFAULT_BOT = os.getenv("DEFAULT_BOT", "sundin")  # solo decide QUÉ JSON cargar si no llega ?bot=
-TWILIO_BOT_MAP = {}
+TWILIO_BOT_MAP: Dict[str, str] = {}
 try:
     TWILIO_BOT_MAP = json.loads(os.getenv("TWILIO_BOT_MAP", "{}"))
 except Exception:
@@ -74,6 +76,7 @@ def _strict_load_json(slug: str) -> Dict[str, Any]:
     rt.setdefault("input_audio_format", "g711_ulaw")
     rt.setdefault("output_audio_format", "g711_ulaw")
     cfg["realtime"] = rt
+
     return cfg
 
 async def _resolve_slug(request: Request) -> str:
@@ -95,7 +98,7 @@ async def _resolve_slug(request: Request) -> str:
 async def index_page():
     return HTMLResponse("<h3>MEI Realtime listo</h3>")
 
-# (A) Ruta compatible con tu configuración actual de Twilio
+# (A) Ruta compatible con configuración Twilio existente
 @app.post("/twiml")
 async def twiml(request: Request):
     host = request.url.hostname or "inhouston-ai-api.onrender.com"
@@ -108,7 +111,7 @@ async def twiml(request: Request):
 </Response>"""
     return Response(xml.strip(), media_type="application/xml")
 
-# (B) Alternativa /outgoing-call (por si prefieres este webhook)
+# (B) Alternativa /outgoing-call
 @app.api_route("/outgoing-call", methods=["GET","POST"])
 async def outgoing_call(request: Request):
     host = request.url.hostname or "inhouston-ai-api.onrender.com"
@@ -150,9 +153,31 @@ async def media_stream(ws: WebSocket):
     out_fmt  = rt["output_audio_format"]     # g711_ulaw
     turn_det = rt["turn_detection"]
 
+    # Idiomas desde JSON (allowed/default/auto_switch) → se inyectan en instructions
+    langs_cfg   = (cfg.get("languages") or {})
+    allowed     = langs_cfg.get("allowed") or ["es-US", "en-US"]
+    default_lng = langs_cfg.get("default") or "es-US"
+    auto_switch = bool(langs_cfg.get("auto_switch", True))
+    lang_clause = [
+        f"Idiomas permitidos: {', '.join(allowed)}.",
+        f"Idioma por defecto: {default_lng}.",
+        ("Cambia automáticamente al idioma del usuario si detectas otro de los permitidos."
+         if auto_switch else
+         "No cambies de idioma automáticamente; mantén el idioma por defecto salvo petición explícita del usuario.")
+    ]
+
+    # Instrucciones finales (prompt del JSON + reglas de idioma + anti-personalización del saludo)
+    merged_instructions = (system_prompt + " " + " ".join(lang_clause)).strip()
+    merged_instructions += (
+        " El primer enunciado DEBE ser exactamente el contenido de 'first_message' si existe; "
+        "no agregues ni quites palabras, no uses el nombre del cliente a menos que él mismo lo diga. "
+        "Nunca saludes con 'Hola, Sarah' ni variantes, porque 'Sara' es el nombre de la agente, no del cliente."
+    )
+
     print(f"🤖 bot={bot_slug} model={model} voice={voice}")
     print(f"🗂️ first_message={'(none)' if not first_message else first_message[:100]!r}")
     print(f"🎛️ realtime={rt}")
+    print(f"🌐 languages: allowed={allowed} default={default_lng} auto_switch={auto_switch}")
 
     # --- Conectar a OpenAI Realtime ---
     ai_url = f"wss://api.openai.com/v1/realtime?model={model}"
@@ -209,23 +234,32 @@ async def media_stream(ws: WebSocket):
         ) as aiws:
             print("🔗 OpenAI Realtime CONNECTED")
 
-            # 1) Configurar sesión EXACTAMENTE como dice el JSON
+            # ARRANQUE: si hay first_message, desactivar create_response para que NO se adelante el modelo
+            td_boot = dict(turn_det)
+            initial_greeting = bool(first_message)
+            if initial_greeting:
+                td_boot["create_response"] = False
+
+            # 1) session.update con instrucciones y td_boot (si aplica)
             session_update = {
                 "type": "session.update",
                 "session": {
-                    "turn_detection": turn_det,
+                    "turn_detection": td_boot if initial_greeting else turn_det,
                     "input_audio_format": in_fmt,
                     "output_audio_format": out_fmt,
                     "voice": voice,
                     "modalities": ["audio","text"],
-                    "instructions": system_prompt,
+                    "instructions": merged_instructions,
                     "temperature": temperature
                 }
             }
             await aiws.send(json.dumps(session_update))
             print("➡️ session.update enviado")
 
-            # 2) Saludo inicial solo si hay first_message en JSON
+            # 2) Saludo inicial literal (si existe)
+            initial_response_id = None
+            waiting_initial_done = initial_greeting
+
             if first_message:
                 await aiws.send(json.dumps({
                     "type": "response.create",
@@ -274,7 +308,7 @@ async def media_stream(ws: WebSocket):
 
             # ---- OpenAI → Twilio ----
             async def o2t():
-                nonlocal user_speaking
+                nonlocal user_speaking, initial_response_id, waiting_initial_done
                 try:
                     async for raw in aiws:
                         try:
@@ -289,6 +323,23 @@ async def media_stream(ws: WebSocket):
 
                         if t == "error":
                             print("❌ OpenAI ERROR:", evt)
+
+                        # Identificar el ID del saludo inicial
+                        if t == "response.created" and waiting_initial_done and initial_response_id is None:
+                            initial_response_id = (evt.get("response") or {}).get("id")
+
+                        # Cuando el saludo inicial termina -> reactivar create_response=True
+                        if t == "response.done" and waiting_initial_done:
+                            resp = evt.get("response") or {}
+                            if resp.get("id") == initial_response_id:
+                                new_td = dict(turn_det)
+                                new_td["create_response"] = True
+                                await aiws.send(json.dumps({
+                                    "type": "session.update",
+                                    "session": { "turn_detection": new_td }
+                                }))
+                                print("✅ VAD reactivado: create_response=True tras el saludo literal")
+                                waiting_initial_done = False
 
                         if t == "input_audio_buffer.speech_started":
                             user_speaking = True
