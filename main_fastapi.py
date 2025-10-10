@@ -1,10 +1,11 @@
 # main_fastapi.py
-# Multibot Twilio ↔ OpenAI Realtime (ajustes oct-2025)
-# - Server VAD realmente activado (barge-in full)
+# Multibot Twilio ↔ OpenAI Realtime — versión “agarra-todo-del-JSON”
+# Cambios clave:
+# - VAD: claves correctas (silence_duration_ms / prefix_padding_ms)
+# - Saludo inicial forzado con voice + output_audio_format (no espera session.update)
 # - g711_ulaw end-to-end (Twilio <-> OpenAI) + keep-alive 20ms
-# - Saludo via first_message (no en system_prompt)
-# - Toma model desde JSON o env OPENAI_REALTIME_MODEL
-# - JSON por bot en bots/<slug>.json (realtime {...})
+# - Model y voz desde JSON (o env OPENAI_REALTIME_MODEL como fallback)
+# - Logs claros para verificar que realmente toma el JSON
 
 import os
 import json
@@ -19,6 +20,7 @@ from fastapi.responses import Response, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.websockets import WebSocketState, WebSocketDisconnect
 
+# ======= ENV / CONFIG =======
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PORT = int(os.getenv("PORT", "8080"))
 ENV_DEFAULT_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "").strip()
@@ -39,6 +41,7 @@ print(f"🧩 TWILIO_BOT_MAP: {TWILIO_BOT_MAP}")
 
 app = FastAPI(title="In Houston AI — Twilio Realtime Bridge (Multibot)")
 
+# CORS (Twilio/WebRTC WS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,13 +50,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ======= AUDIO UTILS =======
 def ulaw_silence_b64(ms: int = 20) -> str:
-    samples = 8_000 * ms // 1000  # 160 bytes @ 20ms
+    """Frame de silencio μ-law 8 kHz (20 ms). μ-law silencio = 0xFF."""
+    samples = 8_000 * ms // 1000  # 160 bytes @20ms
     return base64.b64encode(b"\xFF" * samples).decode("utf-8")
 
+# ======= JSON LOADER =======
 _JSON_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def _load_bot_json(slug: str) -> Dict[str, Any]:
+    """
+    Carga bots/<slug>.json y normaliza campos.
+    Estructura esperada:
+      - voice (str)            -> p.ej. "marin" o "cedar"
+      - temperature (float)
+      - model (str)
+      - system_prompt (str)
+      - first_message (str)
+      - realtime: {
+          "turn_detection": {
+              "type": "server_vad",
+              "silence_duration_ms": 700,
+              "prefix_padding_ms": 100
+          },
+          "input_audio_format": "g711_ulaw",
+          "output_audio_format": "g711_ulaw"
+        }
+    """
     slug = (slug or "").strip().lower() or DEFAULT_BOT
     if slug in _JSON_CACHE:
         return _JSON_CACHE[slug]
@@ -69,25 +93,36 @@ def _load_bot_json(slug: str) -> Dict[str, Any]:
     if cfg is None:
         cfg = {}
 
-    # Defaults sanos
-    cfg.setdefault("voice", "marin")  # voz cálida; puedes cambiar a "cedar"
-    cfg.setdefault("temperature", 0.8)
+    # Defaults sensatos
+    cfg.setdefault("voice", "marin")
+    cfg.setdefault("temperature", 0.85)
+    cfg.setdefault("model", ENV_DEFAULT_MODEL or "gpt-4o-realtime-preview-2024-12-17")
     cfg.setdefault("system_prompt",
         "Eres un asistente de voz de In Houston Texas, español latino, cálido y profesional. "
-        "Responde breve, útil y ofrece agendar cuando aplique."
+        "Responde breve y útil; ofrece agendar cuando aplique. Cede la palabra si el usuario interrumpe (barge-in)."
     )
     cfg.setdefault("first_message", "Hola, soy del equipo de In Houston Texas. ¿En qué te ayudo hoy?")
-    cfg.setdefault("model", ENV_DEFAULT_MODEL or "gpt-4o-realtime-preview-2024-12-17")
 
     rt = cfg.get("realtime") or {}
-    # Aseguramos formato esperado por Realtime API
-    if isinstance(rt.get("turn_detection"), str):
-        rt["turn_detection"] = {"type": rt["turn_detection"]}
-    rt.setdefault("turn_detection", {
-    "type": "server_vad",
-    "silence_duration_ms": 700,
-    "prefix_padding_ms": 100
-})
+    # Normalizar nombres correctos que entiende Realtime
+    if isinstance(rt.get("turn_detection"), dict):
+        td = rt["turn_detection"]
+        # Permitir variantes antiguas y convertirlas
+        if "silence_ms" in td and "silence_duration_ms" not in td:
+            td["silence_duration_ms"] = td.pop("silence_ms")
+        if "prefix_ms" in td and "prefix_padding_ms" not in td:
+            td["prefix_padding_ms"] = td.pop("prefix_ms")
+        td.setdefault("type", "server_vad")
+        td.setdefault("silence_duration_ms", 700)
+        td.setdefault("prefix_padding_ms", 100)
+        rt["turn_detection"] = td
+    else:
+        rt["turn_detection"] = {
+            "type": "server_vad",
+            "silence_duration_ms": 700,
+            "prefix_padding_ms": 100
+        }
+
     rt.setdefault("input_audio_format", "g711_ulaw")
     rt.setdefault("output_audio_format", "g711_ulaw")
     cfg["realtime"] = rt
@@ -95,10 +130,13 @@ def _load_bot_json(slug: str) -> Dict[str, Any]:
     _JSON_CACHE[slug] = cfg
     return cfg
 
+# ======= HELPERS =======
 async def _resolve_bot_slug_from_twilio(request: Request) -> str:
+    # 1) ?bot=slug
     q = dict(request.query_params)
     if "bot" in q and q["bot"].strip():
         return q["bot"].strip().lower()
+    # 2) body Twilio (To/Called) → TWILIO_BOT_MAP
     try:
         form = await request.form()
         to_number = (form.get("To") or form.get("Called") or "").strip()
@@ -106,8 +144,10 @@ async def _resolve_bot_slug_from_twilio(request: Request) -> str:
             return TWILIO_BOT_MAP[to_number].strip().lower()
     except Exception:
         pass
+    # 3) fallback
     return DEFAULT_BOT
 
+# ======= ROUTES =======
 @app.get("/")
 async def root():
     return PlainTextResponse("✅ In Houston AI — FastAPI multibot listo para Twilio Realtime")
@@ -116,6 +156,7 @@ async def root():
 async def twiml_webhook(request: Request):
     host = request.url.hostname or "inhouston-ai-api.onrender.com"
     slug = await _resolve_bot_slug_from_twilio(request)
+    # Conectar Twilio Media Stream a /media pasando el slug
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -134,6 +175,7 @@ async def media_socket(websocket: WebSocket):
         await websocket.close()
         return
 
+    # --- Resolver bot + cargar config ---
     q = dict(websocket.query_params)
     bot_slug = (q.get("bot") or DEFAULT_BOT).strip().lower()
     cfg = _load_bot_json(bot_slug)
@@ -145,11 +187,12 @@ async def media_socket(websocket: WebSocket):
     model = (cfg.get("model") or ENV_DEFAULT_MODEL or "gpt-4o-realtime-preview-2024-12-17").strip()
 
     rt = cfg["realtime"]
-    in_fmt = rt["input_audio_format"]        # 'g711_ulaw'
-    out_fmt = rt["output_audio_format"]      # 'g711_ulaw'
-    turn_det = rt["turn_detection"]          # dict
+    in_fmt = rt["input_audio_format"]          # 'g711_ulaw'
+    out_fmt = rt["output_audio_format"]        # 'g711_ulaw'
+    turn_det = rt["turn_detection"]            # dict
 
     print(f"🤖 [BOT] slug={bot_slug} model={model} voice={voice} temp={temperature}")
+    print(f"🗂️ [CFG] first_message={first_message[:120]!r}")
     print(f"🎛️  [BOT] realtime={{'turn_detection': {turn_det}, 'input_audio_format': '{in_fmt}', 'output_audio_format': '{out_fmt}'}}")
 
     realtime_uri = f"wss://api.openai.com/v1/realtime?model={model}"
@@ -186,11 +229,10 @@ async def media_socket(websocket: WebSocket):
         while websocket.application_state == WebSocketState.CONNECTED:
             try:
                 if user_speaking:
-                    # No pisamos al usuario; sólo keepalive
+                    # No pisar al usuario: sólo keep-alive
                     await _twilio_send_ulaw_b64(SILENCE_20)
                     await asyncio.sleep(0.020)
                     continue
-
                 b64 = await asyncio.wait_for(outbound_queue.get(), timeout=0.060)
                 await _twilio_send_ulaw_b64(b64)
                 outbound_queue.task_done()
@@ -210,6 +252,7 @@ async def media_socket(websocket: WebSocket):
         ) as openai_ws:
             print("🔗 [OpenAI] Realtime CONNECTED")
 
+            # --- 1) Actualizar sesión con formatos / VAD / voz ---
             session_update = {
                 "type": "session.update",
                 "session": {
@@ -220,7 +263,7 @@ async def media_socket(websocket: WebSocket):
                     "modalities": ["audio", "text"],
                     "instructions": system_prompt or (
                         "Eres un asistente de voz en español latino. "
-                        "Saluda breve, sé útil y ofrece agendar cuando aplique."
+                        "Sé breve, útil y ofrece agendar cuando aplique."
                     ),
                     "temperature": temperature,
                 }
@@ -228,14 +271,23 @@ async def media_socket(websocket: WebSocket):
             print(f"➡️  [OpenAI] session.update (voice={voice}, temp={temperature}, in={in_fmt}, out={out_fmt})")
             await openai_ws.send(json.dumps(session_update))
 
+            # --- 2) Forzar primer saludo con voice + formato de salida ---
+            resp_base = {
+                "type": "response.create",
+                "response": {
+                    "modalities": ["audio", "text"],
+                    "voice": voice,
+                    "output_audio_format": out_fmt
+                }
+            }
             if first_message:
-                initial = {"type": "response.create",
-                           "response": {"modalities": ["audio", "text"],
-                                        "instructions": first_message}}
-                await openai_ws.send(json.dumps(initial))
+                resp_base["response"]["instructions"] = first_message
+            await openai_ws.send(json.dumps(resp_base))
 
+            # Lanzar emisor ritmado a Twilio
             sender_task = asyncio.create_task(paced_sender())
 
+            # ---- Twilio → OpenAI (μ-law directo) ----
             async def twilio_to_openai():
                 nonlocal stream_sid
                 try:
@@ -249,6 +301,7 @@ async def media_socket(websocket: WebSocket):
                             print(f"🎧 [Twilio] stream START sid={stream_sid}")
 
                         elif ev == "media":
+                            # μ-law b64 directo al input buffer
                             ulaw_b64 = data["media"]["payload"]
                             await openai_ws.send(json.dumps({
                                 "type": "input_audio_buffer.append",
@@ -275,6 +328,7 @@ async def media_socket(websocket: WebSocket):
                     except Exception:
                         pass
 
+            # ---- OpenAI → Twilio ----
             async def openai_to_twilio():
                 nonlocal user_speaking
                 try:
@@ -297,19 +351,26 @@ async def media_socket(websocket: WebSocket):
                         if t == "error":
                             print(f"❌ [OpenAI] ERROR DETALLE: {evt}")
 
+                        # BARGe-IN: usuario empezó a hablar
                         if t == "input_audio_buffer.speech_started":
                             user_speaking = True
                             await openai_ws.send(json.dumps({"type": "response.cancel"}))
                             await _drain_outbound_queue()
 
+                        # Fin de habla → commit y pedir respuesta (audio+texto)
                         if t == "input_audio_buffer.speech_stopped":
                             user_speaking = False
                             await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                             await openai_ws.send(json.dumps({
                                 "type": "response.create",
-                                "response": {"modalities": ["audio", "text"]}
+                                "response": {
+                                    "modalities": ["audio", "text"],
+                                    "voice": voice,
+                                    "output_audio_format": out_fmt
+                                }
                             }))
 
+                        # Audio del modelo hacia Twilio (μ-law b64)
                         if t in ("response.audio.delta", "response.output_audio.delta"):
                             if user_speaking:
                                 continue
@@ -323,6 +384,7 @@ async def media_socket(websocket: WebSocket):
 
             await asyncio.gather(twilio_to_openai(), openai_to_twilio())
 
+            # Cerrar emisor ritmado
             if not sender_task.done():
                 sender_task.cancel()
                 try:
@@ -337,6 +399,7 @@ async def media_socket(websocket: WebSocket):
     finally:
         print("🔴 [Twilio] WebSocket CLOSED")
 
+# ======= DEBUG =======
 @app.get("/whoami")
 async def whoami(request: Request):
     slug = await _resolve_bot_slug_from_twilio(request)
