@@ -8,7 +8,7 @@
   "email": {
     "to": ["ops@inhoustontexas.us", "sundin@inhoustontexas.us"],
     "from": "In Houston AI <no-reply@inhoustontexas.us>",
-    "subject_prefix": "[INH-ElementLab]"
+    "subject_prefix": "[INH-Sundin]"
   },
   "followups": {
     "send_link_url": "https://multi-bot-inteligente-v1.onrender.com/actions/send-link",
@@ -17,7 +17,11 @@
     "link": "https://calendly.com/houston-school/30min"
   },
   "elevenlabs": {
-    "voice_id": "OPCIONAL_DOC"
+    "voice_id": "OPCIONAL",
+    "inbound_voice_url": "https://api.us.elevenlabs.io/twilio/inbound_call",
+    "inbound_messaging_url": "https://api.us.elevenlabs.io/twilio/inbound_message",
+    "webhook_events": "https://inhouston-ai-api.onrender.com/elevenlabs/events",
+    "webhook_post_call": "https://inhouston-ai-api.onrender.com/elevenlabs/post-call"
   },
-  "tags": ["element-lab", "houston"]
+  "tags": ["houston"]
 }

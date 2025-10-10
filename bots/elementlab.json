@@ -2,8 +2,8 @@
   "id": "elementlab",
   "display_name": "Element Lab",
   "phone_numbers": {
-    "voice": "+1XXXXXXXXXX",
-    "whatsapp": "whatsapp:+1YYYYYYYYYY"
+    "voice": "+1AAAAAAAAAA",
+    "whatsapp": "whatsapp:+1BBBBBBBBBB"
   },
   "email": {
     "to": ["soporte@elementlab.com", "ventas@elementlab.com"],
@@ -17,7 +17,11 @@
     "link": "https://cal.com/elementlab/15min"
   },
   "elevenlabs": {
-    "voice_id": "ELEVEN_VOICE_ID_ELEMENTLAB"
+    "voice_id": "OPCIONAL",
+    "inbound_voice_url": "https://api.us.elevenlabs.io/twilio/inbound_call",
+    "inbound_messaging_url": "https://api.us.elevenlabs.io/twilio/inbound_message",
+    "webhook_events": "https://inhouston-ai-api.onrender.com/elevenlabs/events",
+    "webhook_post_call": "https://inhouston-ai-api.onrender.com/elevenlabs/post-call"
   },
   "tags": ["priority", "houston"]
 }

@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-Router de integraciones ElevenLabs/Level Up (post-llamada + eventos).
-- /levelup/post-call: recibe webhook de Level Up/ElevenLabs al terminar llamada
+Router de integraciones con ElevenLabs (solo integraciones, NO agente).
+- /elevenlabs/post-call: webhook post-llamada de ElevenLabs
   -> detecta bot por número o por 'bot_id' opcional del payload
   -> arma email HTML completo con datos de la llamada y lo envía a los destinatarios del bot
   -> dispara follow-up opcional (send-link) si está configurado en el JSON del bot
-- /levelup/events: recibe otros eventos/transcripciones y manda email
+- /elevenlabs/events: otros eventos/transcripciones y manda email
+
+En Twilio:
+  - A call comes in  -> https://api.us.elevenlabs.io/twilio/inbound_call   (agente)
+  - Call status changes -> POST https://<TU-APP>/twilio/voice/status       (opcional)
+  - Messaging Status Callback -> POST https://<TU-APP>/twilio/messaging/status (opcional)
+
+En ElevenLabs:
+  - Post-call webhook -> POST https://<TU-APP>/elevenlabs/post-call
+  - Events/Transcripts -> POST https://<TU-APP>/elevenlabs/events
 """
 
 import os
@@ -57,44 +66,31 @@ def flatten_strings(obj: Any):
             yield str(obj)
 
 def detect_phone(payload: Dict[str, Any]) -> Optional[str]:
-    # pistas comunes
     keys = ["from", "caller", "caller_number", "ani", "customer_phone", "user_phone", "contact", "phone", "source"]
     for k in keys:
         if k in payload and payload[k]:
             n = normalize_phone(str(payload[k]))
             if n: return n
-    # fallback: buscar en todo
     for v in flatten_strings(payload):
         n = normalize_phone(v)
         if n: return n
     return None
 
 def resolve_bot(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Resuelve bot por:
-      1) bot_id (si viene en payload)
-      2) número (to/recipient) si viene
-      3) heurística por teléfono detectado
-      4) primero de la lista (fallback)
-    """
-    bot_id = payload.get("bot_id") or payload.get("agent_id") or payload.get("bot")  # por si LevelUp manda algo
+    bot_id = payload.get("bot_id") or payload.get("agent_id") or payload.get("bot")
     if bot_id and registry.get(bot_id):
         return registry.get(bot_id)
 
-    # intentamos por 'to'/'recipient'/'called_number'
     to_like = payload.get("to") or payload.get("recipient") or payload.get("called_number")
     if to_like:
         bot = registry.find_by_number(str(to_like))
         if bot: return bot
 
-    # heurística por teléfono detectado
     phone = detect_phone(payload)
     if phone:
-        # Si el teléfono detectado es del BOT (To) quizá venga con prefijo 'whatsapp:' en payloads
         bot = registry.find_by_number(phone) or registry.find_by_number(f"whatsapp:{phone}")
         if bot: return bot
 
-    # fallback
     bots = registry.all()
     return bots[0] if bots else {}
 
@@ -116,21 +112,18 @@ def get_bot_followups(bot: Dict[str, Any]) -> Dict[str, Any]:
         "link": fu.get("link")
     }
 
-@router.post("/levelup/post-call")
+@router.post("/elevenlabs/post-call")
 async def post_call(request: Request):
-    # 1) Parse payload
     try:
         data = await request.json()
     except Exception:
         form = await request.form()
         data = {k: form.get(k) for k in form.keys()}
 
-    # 2) Resolver bot y configuración
     bot = resolve_bot(data)
     email_cfg = get_bot_email_config(bot)
     followups = get_bot_followups(bot)
 
-    # 3) Extraer campos estándar (flexibles a la forma de Level Up)
     conv_id = data.get("conversation_id") or data.get("session_id") or data.get("id") or "unknown"
     from_num = normalize_phone(data.get("from") or data.get("caller") or data.get("ani") or "")
     to_num = normalize_phone(data.get("to") or data.get("recipient") or data.get("called_number") or "")
@@ -140,7 +133,6 @@ async def post_call(request: Request):
     transcript = data.get("transcript") or data.get("summary") or ""
     agent_name = bot.get("display_name") or data.get("agent_name") or "Agente"
 
-    # 4) Email HTML (plantilla)
     html = render_email(
         "notification_call.html",
         {
@@ -159,7 +151,6 @@ async def post_call(request: Request):
     )
     subject = f"{email_cfg['subject_prefix']} CALL {status} | {agent_name} | {conv_id}"
 
-    # 5) Enviar email
     email_res = send_email_html(
         subject=subject,
         html=html,
@@ -167,7 +158,6 @@ async def post_call(request: Request):
         text_fallback=f"CALL {status} {conv_id}\nFrom: {from_num}\nTo: {to_num}\nDur: {duration}\nRec: {recording_url}\n\n{transcript}"
     )
 
-    # 6) Follow-up opcional (SMS/WA con link)
     follow_result = None
     if followups.get("send_link_url") and followups.get("bot") and followups.get("link") and from_num:
         payload = {
@@ -190,9 +180,8 @@ async def post_call(request: Request):
         "bot_display": bot.get("display_name")
     })
 
-@router.post("/levelup/events")
-async def levelup_events(request: Request):
-    # Recibe cualquier evento o transcript parcial y lo reenvía a email
+@router.post("/elevenlabs/events")
+async def eleven_events(request: Request):
     try:
         data = await request.json()
     except Exception:
@@ -226,4 +215,3 @@ async def levelup_events(request: Request):
     email_res = send_email_html(subject=subject, html=html, to=email_cfg["to"])
 
     return JSONResponse({"ok": True, "email": email_res, "bot_id": bot.get("id")})
-
