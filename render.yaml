@@ -2,12 +2,6 @@ services:
   - type: web
     name: inh-multiagents
     env: python
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT main_fastapi:app
     autoDeploy: true
-    envVars:
-      - key: FLASK_ENV
-        value: production
-      - key: BOTS_DIR
-        value: ./bots
