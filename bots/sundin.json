@@ -8,8 +8,12 @@
   "system_prompt": "Hablas SIEMPRE en español latino, cálido y profesional. Responde en frases breves y claras, haz una pregunta de seguimiento cuando ayude al cliente, y ofrece agendar una cita cuando tenga sentido. Si el usuario interrumpe, cede la palabra de inmediato (barge-in). No repitas el saludo inicial.",
 
   "realtime": {
-    "turn_detection": { "type": "server_vad", "silence_ms": 700, "prefix_ms": 100 },
-    "input_audio_format": "g711_ulaw",
-    "output_audio_format": "g711_ulaw"
-  }
+  "turn_detection": {
+    "type": "server_vad",
+    "silence_duration_ms": 700,
+    "prefix_padding_ms": 100
+  },
+  "input_audio_format": "g711_ulaw",
+  "output_audio_format": "g711_ulaw"
+}
 }

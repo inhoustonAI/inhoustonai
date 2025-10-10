@@ -83,7 +83,11 @@ def _load_bot_json(slug: str) -> Dict[str, Any]:
     # Aseguramos formato esperado por Realtime API
     if isinstance(rt.get("turn_detection"), str):
         rt["turn_detection"] = {"type": rt["turn_detection"]}
-    rt.setdefault("turn_detection", {"type": "server_vad", "silence_ms": 700, "prefix_ms": 100})
+    rt.setdefault("turn_detection", {
+    "type": "server_vad",
+    "silence_duration_ms": 700,
+    "prefix_padding_ms": 100
+})
     rt.setdefault("input_audio_format", "g711_ulaw")
     rt.setdefault("output_audio_format", "g711_ulaw")
     cfg["realtime"] = rt
