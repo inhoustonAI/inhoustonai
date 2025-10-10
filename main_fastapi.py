@@ -1,247 +1,234 @@
 # -*- coding: utf-8 -*-
 """
-Main FastAPI multi-agentes (Twilio + ElevenLabs)
+INH Integrations (FastAPI) — Level Up first
 
-Cambios clave:
-- Enrutamiento por **To** (tu número de Twilio) para elegir el bot correcto.
-- /bots/reload con token opcional (header X-Reload-Token o ?token=) para recargar JSON sin reiniciar.
-- WhatsApp/SMS responden texto y, si aplica, adjuntan MP3 TTS.
-- Voice usa <Play> hacia /tts; fallback a <Say>.
+Arquitectura:
+- El AGENTE (voz / chat) lo maneja **Level Up** (ElevenLabs).
+- Este servicio solo maneja **integraciones** y **notificaciones por email**.
 
-Env opcionales:
-  BOTS_RELOAD_TOKEN=__SET__   # si está definido, /bots/reload exige token
-  DEFAULT_VOICE_ID=...        # voz por defecto de ElevenLabs
+Endpoints:
+- GET  /health
+- POST /twilio/voice/status         -> Twilio Voice Status Callback (inicio/fin de llamada)
+- POST /twilio/messaging/status     -> Twilio Messaging Status Callback (SMS/WhatsApp)
+- POST /levelup/events              -> Webhook genérico desde Level Up (transcripciones / eventos)
+
+ENV requeridas/útiles:
+  # Email (SMTP)
+  SMTP_HOST=smtp.gmail.com
+  SMTP_PORT=587
+  SMTP_USER=__SET__
+  SMTP_PASS=__SET__
+  MAIL_FROM="In Houston AI <no-reply@inhoustontexas.us>"
+  MAIL_TO="ops@inhoustontexas.us,sundin@..."   # múltiples separados por coma
+
+  # Opcional: tagging del proyecto
+  PROJECT_TAG=INH-MultiAgents
 """
-import json
+
 import os
 import pathlib
-from typing import Any, Dict, Optional
+import json
+import smtplib
+from typing import Any, Dict, Optional, List
+from email.message import EmailMessage
+from datetime import datetime, timezone
 
-import requests
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from dotenv import load_dotenv
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.twiml.voice_response import VoiceResponse
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
 
+# --------- Config ---------
 FLASK_ENV = os.getenv("FLASK_ENV", "development")
 PORT = int(os.getenv("PORT", "5000"))
+PROJECT_TAG = os.getenv("PROJECT_TAG", "INH")
 
-# Twilio (no necesitamos el client para TwiML en webhooks)
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
-TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")
-TWILIO_VOICE_FROM = os.getenv("TWILIO_VOICE_FROM", "")
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+MAIL_FROM = os.getenv("MAIL_FROM", "no-reply@example.com")
+MAIL_TO = [e.strip() for e in os.getenv("MAIL_TO", "").split(",") if e.strip()]
 
-# ElevenLabs
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
-DEFAULT_VOICE_ID = os.getenv("DEFAULT_VOICE_ID", "")
+# --------- App ---------
+app = FastAPI(title="INH Integrations (FastAPI)")
 
-# Bots
-BOTS_DIR = os.getenv("BOTS_DIR", str(ROOT_DIR / "bots"))
+# --------- Helpers ---------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
-# Seguridad mínima para /bots/reload
-BOTS_RELOAD_TOKEN = os.getenv("BOTS_RELOAD_TOKEN", "").strip()
+def pretty(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(obj)
 
-# -----------------------------
-# Utils: bots
-# -----------------------------
-def _load_bots(bots_dir: str):
-    data: Dict[str, Dict[str, Any]] = {}
-    p = pathlib.Path(bots_dir)
-    if not p.is_dir():
-        return data
-    for f in p.glob("*.json"):
-        try:
-            with f.open("r", encoding="utf-8") as fh:
-                obj = json.load(fh)
-            bot_id = obj.get("id") or f.stem
-            data[bot_id] = obj
-        except Exception as e:
-            print(f"[WARN] No se pudo cargar {f.name}: {e}")
-    return data
-
-BOTS_REGISTRY = _load_bots(BOTS_DIR)
-
-def reload_bots():
-    global BOTS_REGISTRY
-    BOTS_REGISTRY = _load_bots(BOTS_DIR)
-
-def find_bot_by_number_to(number: str) -> Optional[Dict[str, Any]]:
+def send_email(subject: str, text: str, html: Optional[str] = None,
+               to: Optional[List[str]] = None, attachments: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """
-    Busca el bot por el número **To** (tu número en Twilio):
-      - phone_numbers.voice: "+1..."
-      - phone_numbers.whatsapp: "whatsapp:+1..."
+    Envía email vía SMTP (TLS).
+    attachments: lista de dicts: {"filename": "...", "content": bytes, "mime": "audio/mpeg"}
     """
-    if not number:
-        return None
-    n = str(number).strip().lower()
-    for bot in BOTS_REGISTRY.values():
-        nums = bot.get("phone_numbers", {})
-        voice = str(nums.get("voice", "")).lower()
-        wa = str(nums.get("whatsapp", "")).lower()
-        if n == voice or n == wa:
-            return bot
-    return None
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS or not MAIL_FROM:
+        return {"ok": False, "reason": "SMTP env missing"}
 
-def make_absolute_url(request: Request, path: str) -> str:
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("host") or request.url.hostname
-    if not path.startswith("/"):
-        path = "/" + path
-    return f"{proto}://{host}{path}"
+    recipients = to or MAIL_TO
+    if not recipients:
+        return {"ok": False, "reason": "No recipients configured (MAIL_TO)"}
 
-def bot_voice_id(bot: Optional[Dict[str, Any]]) -> str:
-    if bot and bot.get("elevenlabs", {}).get("voice_id"):
-        return bot["elevenlabs"]["voice_id"]
-    return DEFAULT_VOICE_ID
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = MAIL_FROM
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(text or "")
 
-def is_whatsapp_num(num: str) -> bool:
-    return str(num).lower().startswith("whatsapp:")
+    if html:
+        msg.add_alternative(html, subtype="html")
 
-# -----------------------------
-# FastAPI app
-# -----------------------------
-app = FastAPI(title="INH MultiAgents (FastAPI)")
+    for att in attachments or []:
+        msg.add_attachment(att["content"], maintype=(att.get("mime","application/octet-stream").split("/")[0]),
+                           subtype=(att.get("mime","application/octet-stream").split("/")[1]),
+                           filename=att.get("filename","file.bin"))
 
-@app.get("/")
-def root():
-    return JSONResponse({"ok": True, "service": "INH MultiAgents (FastAPI)"})
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
+        smtp.starttls()
+        smtp.login(SMTP_USER, SMTP_PASS)
+        smtp.send_message(msg)
 
+    return {"ok": True, "sent_to": recipients}
 
-# -----------------------------
-# Básicos
-# -----------------------------
+# --------- Routes ---------
 @app.get("/health")
 def health():
     return JSONResponse({
         "status": "ok",
         "env": FLASK_ENV,
-        "bots_count": len(BOTS_REGISTRY),
-        "elevenlabs": bool(ELEVENLABS_API_KEY)
+        "ts": now_iso(),
+        "mail_to": MAIL_TO,
+        "project": PROJECT_TAG
     })
 
-@app.get("/bots")
-def list_bots():
-    return JSONResponse({"bots": list(BOTS_REGISTRY.values())})
-
-@app.post("/bots/reload")
-async def bots_reload(request: Request):
-    """
-    Recarga los JSON en BOTS_DIR.
-    Seguridad mínima: si BOTS_RELOAD_TOKEN está definido, exige:
-      - Header:    X-Reload-Token: <token>
-        o
-      - Query:     ?token=<token>
-    """
-    token = request.headers.get("x-reload-token") or request.query_params.get("token")
-    if BOTS_RELOAD_TOKEN and token != BOTS_RELOAD_TOKEN:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    reload_bots()
-    return JSONResponse({"reloaded": True, "bots_count": len(BOTS_REGISTRY)})
-
-
 # -----------------------------
-# Webhook: SMS/WhatsApp
-# - Responde texto
-# - Si hay ElevenLabs y voice_id, adjunta MP3 como Media (solo WhatsApp/MMS)
+# Twilio Voice: Status Callback
+# Configurar en Twilio Number:
+#   Voice -> "Call status changes" -> POST https://<tu-app>/twilio/voice/status
 # -----------------------------
-@app.post("/twilio/sms")
-async def twilio_sms(request: Request) -> Response:
+@app.post("/twilio/voice/status")
+async def twilio_voice_status(request: Request):
     form = await request.form()
-    # Enrutar por **To** (tu número en Twilio)
-    to_number = str(form.get("To", "")).strip()
-    body = (str(form.get("Body", "")).strip()) or "Hola 👋"
-    bot = find_bot_by_number_to(to_number)
+    # Campos comunes de Twilio Voice status callback
+    payload = {k: form.get(k) for k in form.keys()}  # dict plano
+    call_sid = payload.get("CallSid")
+    status = payload.get("CallStatus")         # queued | ringing | in-progress | completed | busy | failed | no-answer
+    from_ = payload.get("From")
+    to_ = payload.get("To")
+    duration = payload.get("CallDuration")     # en segundos (si completed)
+    recording_url = payload.get("RecordingUrl") or payload.get("RecordingUrl0")  # si existe
+    account = payload.get("AccountSid")
 
-    label = bot["display_name"] if bot and bot.get("display_name") else "Agente"
-    prompt = (bot.get("prompt") if bot else None) or "¿En qué puedo ayudarte?"
-
-    reply_text = f"[{label}] Recibido: {body}\n{prompt}"
-
-    twiml = MessagingResponse()
-    msg = twiml.message(reply_text)
-
-    # Adjuntar audio si es WhatsApp y tenemos TTS
-    v_id = bot_voice_id(bot)
-    if ELEVENLABS_API_KEY and v_id and is_whatsapp_num(to_number):
-        from urllib.parse import urlencode, quote_plus
-        tts_text = f"{label} confirma: recibí tu mensaje: {body}."
-        qs = urlencode({"text": tts_text, "voice_id": v_id}, quote_via=quote_plus)
-        media_url = make_absolute_url(request, f"/tts?{qs}")
-        msg.media(media_url)
-
-    return Response(str(twiml), media_type="application/xml")
-
+    subject = f"[{PROJECT_TAG}] CALL {status} | {to_} <- {from_} | {call_sid}"
+    lines = [
+        f"Project: {PROJECT_TAG}",
+        f"Time: {now_iso()}",
+        f"Status: {status}",
+        f"From: {from_}",
+        f"To: {to_}",
+        f"CallSid: {call_sid}",
+        f"AccountSid: {account}",
+        f"Duration(s): {duration or '-'}",
+        f"RecordingUrl: {recording_url or '-'}",
+        "",
+        "Raw form:",
+        pretty(payload),
+    ]
+    res = send_email(subject, "\n".join(lines))
+    return JSONResponse({"ok": True, "email": res})
 
 # -----------------------------
-# Webhook: Voice
-# - Si hay ElevenLabs -> <Play> /tts
-# - Si no, fallback a <Say>
+# Twilio Messaging: Status Callback
+# Configurar:
+#   - En el Messaging Service (recomendado): Status Callback URL -> POST https://<tu-app>/twilio/messaging/status
+#     (o en el número individual si no usas service)
+# Nota: esto reporta estados (sent, delivered, failed). Para INBOUND content,
+#       el agente Level Up debe avisarnos vía /levelup/events.
 # -----------------------------
-@app.post("/twilio/voice")
-async def twilio_voice(request: Request) -> Response:
+@app.post("/twilio/messaging/status")
+async def twilio_msg_status(request: Request):
     form = await request.form()
-    # Enrutar por **To** (tu número en Twilio)
-    to_number = str(form.get("To", "")).strip()
-    bot = find_bot_by_number_to(to_number)
+    payload = {k: form.get(k) for k in form.keys()}
+    msg_sid = payload.get("MessageSid")
+    status = payload.get("MessageStatus")      # accepted | queued | sent | delivered | undelivered | failed | read (WA)
+    from_ = payload.get("From")
+    to_ = payload.get("To")
+    body = payload.get("Body")  # no siempre viene en status callback
 
-    display = bot["display_name"] if bot and bot.get("display_name") else "Agente"
-    prompt = (bot.get("prompt") if bot else None) or "Hola, ¿en qué puedo ayudarte?"
-    text = f"Hola, estás hablando con {display}. {prompt}"
-
-    vr = VoiceResponse()
-    v_id = bot_voice_id(bot)
-    if ELEVENLABS_API_KEY and v_id:
-        from urllib.parse import urlencode, quote_plus
-        qs = urlencode({"text": text, "voice_id": v_id}, quote_via=quote_plus)
-        tts_url = make_absolute_url(request, f"/tts?{qs}")
-        vr.play(tts_url)
-    else:
-        vr.say(text, language="es-ES")
-
-    return Response(str(vr), media_type="application/xml")
-
+    subject = f"[{PROJECT_TAG}] MSG {status} | {to_} <- {from_} | {msg_sid}"
+    lines = [
+        f"Project: {PROJECT_TAG}",
+        f"Time: {now_iso()}",
+        f"Status: {status}",
+        f"From: {from_}",
+        f"To: {to_}",
+        f"MessageSid: {msg_sid}",
+        f"Body (if present): {body or '-'}",
+        "",
+        "Raw form:",
+        pretty(payload),
+    ]
+    res = send_email(subject, "\n".join(lines))
+    return JSONResponse({"ok": True, "email": res})
 
 # -----------------------------
-# TTS: ElevenLabs -> audio/mpeg
+# Level Up: Webhook genérico
+# Configurar en Level Up (ElevenLabs):
+#   - Webhook URL -> POST https://<tu-app>/levelup/events
+#   - Enviar transcripciones/turnos/metadata de conversación
+# Este endpoint no asume un esquema fijo: manda EMAIL con el JSON crudo.
+# Si el JSON trae campos típicos (conversation_id, channel, transcript, messages),
+# los resalta en el asunto/cuerpo.
 # -----------------------------
-def elevenlabs_tts_bytes(text: str, voice_id: str, model_id: str = "eleven_turbo_v2") -> bytes:
-    if not ELEVENLABS_API_KEY:
-        raise RuntimeError("Falta ELEVENLABS_API_KEY")
-    if not voice_id:
-        raise RuntimeError("Falta voice_id (DEFAULT_VOICE_ID o por bot)")
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "accept": "audio/mpeg",
-        "content-type": "application/json"
-    }
-    payload = {
-        "text": text,
-        "model_id": model_id,
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.7}
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    r.raise_for_status()
-    return r.content
-
-@app.get("/tts")
-def tts(text: str, voice_id: Optional[str] = None, model_id: str = "eleven_turbo_v2"):
-    v_id = voice_id or DEFAULT_VOICE_ID
+@app.post("/levelup/events")
+async def levelup_events(request: Request):
     try:
-        mp3 = elevenlabs_tts_bytes(text=text, voice_id=v_id, model_id=model_id)
-    except Exception as e:
-        return PlainTextResponse(f"TTS error: {e}", status_code=500)
-    return StreamingResponse(iter([mp3]), media_type="audio/mpeg")
+        data = await request.json()
+    except Exception:
+        # Si envían form-url-encoded, intenta convertir
+        form = await request.form()
+        data = {k: form.get(k) for k in form.keys()}
 
+    # Heurísticas para el asunto
+    conv_id = data.get("conversation_id") or data.get("session_id") or data.get("id") or "unknown"
+    channel = data.get("channel") or data.get("source") or "voice/chat"
+    event_type = data.get("type") or "event"
+    title = data.get("title") or ""
+    # Posible transcript directo
+    transcript = data.get("transcript") or data.get("summary") or ""
+
+    subject = f"[{PROJECT_TAG}] LEVELUP {event_type} | {channel} | {conv_id}"
+    if title:
+        subject += f" | {title}"
+
+    # Construir cuerpo
+    lines = [
+        f"Project: {PROJECT_TAG}",
+        f"Time: {now_iso()}",
+        f"Event Type: {event_type}",
+        f"Channel: {channel}",
+        f"Conversation ID: {conv_id}",
+        "",
+    ]
+    if transcript:
+        lines += ["--- Transcript / Summary ---", transcript, ""]
+
+    lines += ["--- Raw JSON ---", pretty(data)]
+
+    res = send_email(subject, "\n".join(lines))
+    return JSONResponse({"ok": True, "email": res})
 
 # -----------------------------
-# Run local (dev)
+# Run local
 # -----------------------------
 if __name__ == "__main__":
     import uvicorn
