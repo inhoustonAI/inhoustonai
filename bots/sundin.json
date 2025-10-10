@@ -6,9 +6,9 @@
     "whatsapp": "whatsapp:+18325512420"
   },
   "email": {
-    "to": ["ops@inhoustontexas.us", "sundin@inhoustontexas.us"],
-    "from": "In Houston AI <no-reply@inhoustontexas.us>",
-    "subject_prefix": "[INH-Sundin]"
+    "to": ["info@inhoustontexas.us", "sundingalue@gmail.com"],
+    "from": "In Houston AI <info@inhoustontexas.us>",
+    "subject_prefix": "[INH-NOTIFICACIÓN]"
   },
   "followups": {
     "send_link_url": "https://multi-bot-inteligente-v1.onrender.com/actions/send-link",
