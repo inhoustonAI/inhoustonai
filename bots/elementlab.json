@@ -1,0 +1,23 @@
+{
+  "id": "elementlab",
+  "display_name": "Element Lab",
+  "phone_numbers": {
+    "voice": "+1XXXXXXXXXX",
+    "whatsapp": "whatsapp:+1YYYYYYYYYY"
+  },
+  "email": {
+    "to": ["soporte@elementlab.com", "ventas@elementlab.com"],
+    "from": "Element Lab Notifier <no-reply@elementlab.com>",
+    "subject_prefix": "[ElementLab]"
+  },
+  "followups": {
+    "send_link_url": "https://multi-bot-inteligente-v1.onrender.com/actions/send-link",
+    "bot": "whatsapp:+18325550123",
+    "channel": "wa",
+    "link": "https://cal.com/elementlab/15min"
+  },
+  "elevenlabs": {
+    "voice_id": "ELEVEN_VOICE_ID_ELEMENTLAB"
+  },
+  "tags": ["priority", "houston"]
+}
