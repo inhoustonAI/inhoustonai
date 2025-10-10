@@ -1,10 +1,23 @@
 {
   "id": "sundin",
-  "display_name": "Sundin",
+  "display_name": "Sundin / In Houston AI",
   "phone_numbers": {
-    "voice": "+18326213202",           
-    "whatsapp": "whatsapp:+18325559876" 
+    "voice": "+1XXXXXXXXXX",
+    "whatsapp": "whatsapp:+1YYYYYYYYYY"
   },
-  "elevenlabs": { "voice_id": "agent_8301k6n79bmvekcbx7vqby7asrze" },
-  "prompt": "Bienvenido a In Houston AI..."
+  "email": {
+    "to": ["ops@inhoustontexas.us", "sundin@inhoustontexas.us"],
+    "from": "In Houston AI <no-reply@inhoustontexas.us>",
+    "subject_prefix": "[INH-ElementLab]"
+  },
+  "followups": {
+    "send_link_url": "https://multi-bot-inteligente-v1.onrender.com/actions/send-link",
+    "bot": "whatsapp:+18326213202",
+    "channel": "sms",
+    "link": "https://calendly.com/houston-school/30min"
+  },
+  "elevenlabs": {
+    "voice_id": "OPCIONAL_DOC"
+  },
+  "tags": ["element-lab", "houston"]
 }

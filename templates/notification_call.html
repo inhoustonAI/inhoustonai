@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>{{ agent_name }} — Notificación de llamada</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;line-height:1.4;margin:0;background:#f6f7fb;color:#111}
+    .wrap{max-width:720px;margin:0 auto;padding:24px}
+    .card{background:#fff;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.06);padding:20px;margin-bottom:16px;border:1px solid #eee}
+    .title{font-size:18px;font-weight:700;margin:0 0 4px}
+    .muted{color:#666;font-size:12px;margin:0 0 12px}
+    .grid{display:grid;grid-template-columns:160px 1fr;gap:8px}
+    .key{color:#444}
+    pre{background:#0b1021;color:#e2e8f0;padding:12px;border-radius:8px;overflow:auto;font-size:12px}
+    .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;background:#eef;border:1px solid #ccd;color:#223}
+    .bot{font-weight:600}
+    a{color:#0a6;word-break:break-all}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="title">Notificación — {{ agent_name }}</div>
+      <div class="muted">{{ ts }}</div>
+      <div class="grid">
+        <div class="key">Bot</div><div><span class="bot">{{ bot.display_name or bot.id }}</span></div>
+        <div class="key">Conversación</div><div><span class="badge">{{ conv_id }}</span></div>
+        <div class="key">Estado</div><div>{{ status }}</div>
+        <div class="key">Duración</div><div>{{ duration }}</div>
+        <div class="key">De (cliente)</div><div>{{ from_num }}</div>
+        <div class="key">A (tu número)</div><div>{{ to_num }}</div>
+        <div class="key">Grabación</div><div>{% if recording_url and recording_url != '-' %}<a href="{{ recording_url }}">{{ recording_url }}</a>{% else %}-{% endif %}</div>
+      </div>
+    </div>
+
+    {% if transcript %}
+    <div class="card">
+      <div class="title">Transcripción / Resumen</div>
+      <pre>{{ transcript }}</pre>
+    </div>
+    {% endif %}
+
+    <div class="card">
+      <div class="title">Payload crudo</div>
+      <pre>{{ raw_json }}</pre>
+    </div>
+  </div>
+</body>
+</html>
