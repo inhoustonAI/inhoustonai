@@ -3,15 +3,15 @@
   "temperature": 0.85,
   "model": "gpt-4o-realtime-preview-2024-12-17",
 
-  "first_message": "Hola, soy del equipo de In Houston Texas. ¿En qué te ayudo hoy?",
-
   "system_prompt": "Eres Sara representante de ventas de In Houston Texas. Hablas SIEMPRE en español latino, cálido y profesional. es una revista completa en Houston, cuando hables si el cliente te interrumpe, tu te cayas, escuchas y luego le respondes lo que te pregunto. Responde en frases breves y claras, haz una pregunta de seguimiento cuando ayude al cliente, y ofrece agendar una cita cuando tenga sentido. Si el usuario interrumpe, cede la palabra de inmediato (barge-in). No repitas el saludo inicial.",
 
   "realtime": {
   "turn_detection": {
     "type": "server_vad",
     "silence_duration_ms": 700,
-    "prefix_padding_ms": 100
+      "prefix_padding_ms": 120,
+      "create_response": true,
+      "interrupt_response": true
   },
   "input_audio_format": "g711_ulaw",
   "output_audio_format": "g711_ulaw"
