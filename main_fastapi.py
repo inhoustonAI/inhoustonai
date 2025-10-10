@@ -2,11 +2,10 @@
 """
 App raíz (FastAPI) — Integraciones con ElevenLabs por módulos/carpetas.
 - Lee bots/*.json para email/followups por bot.
-- Monta el router de 'llamadas_elevenlab' (webhooks post-call y eventos).
-- Monta el router 'common' (/bots, /bots/reload).
-
-Inbound Twilio (A call/message comes in): -> URL de ElevenLabs.
-Este servicio maneja SOLO integraciones (emails, follow-ups, logging).
+- Monta:
+    * /elevenlabs/*  (webhooks post-call y events de ElevenLabs)
+    * /bots, /bots/reload  (registry de bots)
+    * /twilio/voice/status y /twilio/messaging/status  (callbacks de estado Twilio)
 """
 
 import os
@@ -15,7 +14,7 @@ import pathlib
 from fastapi import FastAPI
 from dotenv import load_dotenv
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # -------- Carga .env --------
 ROOT_DIR = pathlib.Path(__file__).resolve().parent
@@ -31,9 +30,11 @@ app = FastAPI(title="INH Integrations (FastAPI) — ElevenLabs only", version=AP
 # -------- Routers --------
 from integrations.llamadas_elevenlab.router import router as llamadas_router
 from integrations.common.router import router as common_router
+from integrations.twilio_status.router import router as twilio_router  # ← agregado
 
-app.include_router(llamadas_router, prefix="")   # /elevenlabs/*
-app.include_router(common_router, prefix="")     # /bots, /bots/reload
+app.include_router(llamadas_router, prefix="")  # /elevenlabs/*
+app.include_router(common_router, prefix="")    # /bots, /bots/reload
+app.include_router(twilio_router, prefix="")    # /twilio/* status  ← agregado
 
 # -------- Rutas básicas --------
 @app.get("/")
@@ -52,7 +53,7 @@ def health():
         "status": "ok",
         "env": os.getenv("FLASK_ENV", "development"),
         "bots_count": len(registry.all()),
-        "modules": ["llamadas_elevenlab", "common"],
+        "modules": ["llamadas_elevenlab", "common", "twilio_status"],  # ← agregado
         "version": APP_VERSION
     }
 
