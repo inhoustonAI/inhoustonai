@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Main FastAPI multi-agentes (Twilio + ElevenLabs)
-Endpoints:
-- GET  /health                  -> estado del servicio
-- GET  /bots                    -> lista de bots (desde ./bots/*.json)
-- POST /bots/reload             -> recargar bots
-- POST /twilio/sms              -> webhook SMS/WhatsApp (Twilio)
-- POST /twilio/voice            -> webhook Voice (Twilio) con <Play> a /tts
-- GET  /tts?text=..&voice_id=.. -> genera MP3 (audio/mpeg) con ElevenLabs
+
+Cambios clave:
+- Enrutamiento por **To** (tu número de Twilio) para elegir el bot correcto.
+- /bots/reload con token opcional (header X-Reload-Token o ?token=) para recargar JSON sin reiniciar.
+- WhatsApp/SMS responden texto y, si aplica, adjuntan MP3 TTS.
+- Voice usa <Play> hacia /tts; fallback a <Say>.
+
+Env opcionales:
+  BOTS_RELOAD_TOKEN=__SET__   # si está definido, /bots/reload exige token
+  DEFAULT_VOICE_ID=...        # voz por defecto de ElevenLabs
 """
 import json
 import os
@@ -27,7 +30,7 @@ load_dotenv(dotenv_path=ROOT_DIR / ".env")
 FLASK_ENV = os.getenv("FLASK_ENV", "development")
 PORT = int(os.getenv("PORT", "5000"))
 
-# Twilio
+# Twilio (no necesitamos el client para TwiML en webhooks)
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")
@@ -39,6 +42,9 @@ DEFAULT_VOICE_ID = os.getenv("DEFAULT_VOICE_ID", "")
 
 # Bots
 BOTS_DIR = os.getenv("BOTS_DIR", str(ROOT_DIR / "bots"))
+
+# Seguridad mínima para /bots/reload
+BOTS_RELOAD_TOKEN = os.getenv("BOTS_RELOAD_TOKEN", "").strip()
 
 # -----------------------------
 # Utils: bots
@@ -64,7 +70,12 @@ def reload_bots():
     global BOTS_REGISTRY
     BOTS_REGISTRY = _load_bots(BOTS_DIR)
 
-def find_bot_by_number(number: str) -> Optional[Dict[str, Any]]:
+def find_bot_by_number_to(number: str) -> Optional[Dict[str, Any]]:
+    """
+    Busca el bot por el número **To** (tu número en Twilio):
+      - phone_numbers.voice: "+1..."
+      - phone_numbers.whatsapp: "whatsapp:+1..."
+    """
     if not number:
         return None
     n = str(number).strip().lower()
@@ -118,7 +129,17 @@ def list_bots():
     return JSONResponse({"bots": list(BOTS_REGISTRY.values())})
 
 @app.post("/bots/reload")
-def bots_reload():
+async def bots_reload(request: Request):
+    """
+    Recarga los JSON en BOTS_DIR.
+    Seguridad mínima: si BOTS_RELOAD_TOKEN está definido, exige:
+      - Header:    X-Reload-Token: <token>
+        o
+      - Query:     ?token=<token>
+    """
+    token = request.headers.get("x-reload-token") or request.query_params.get("token")
+    if BOTS_RELOAD_TOKEN and token != BOTS_RELOAD_TOKEN:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     reload_bots()
     return JSONResponse({"reloaded": True, "bots_count": len(BOTS_REGISTRY)})
 
@@ -126,35 +147,32 @@ def bots_reload():
 # -----------------------------
 # Webhook: SMS/WhatsApp
 # - Responde texto
-# - Si hay ElevenLabs y voice_id, adjunta MP3 como Media (WhatsApp/MMS)
+# - Si hay ElevenLabs y voice_id, adjunta MP3 como Media (solo WhatsApp/MMS)
 # -----------------------------
 @app.post("/twilio/sms")
 async def twilio_sms(request: Request) -> Response:
     form = await request.form()
-    from_number = str(form.get("From", "")).strip()
+    # Enrutar por **To** (tu número en Twilio)
+    to_number = str(form.get("To", "")).strip()
     body = (str(form.get("Body", "")).strip()) or "Hola 👋"
-    bot = find_bot_by_number(from_number)
+    bot = find_bot_by_number_to(to_number)
 
     label = bot["display_name"] if bot and bot.get("display_name") else "Agente"
     prompt = (bot.get("prompt") if bot else None) or "¿En qué puedo ayudarte?"
 
-    # Mensaje base
     reply_text = f"[{label}] Recibido: {body}\n{prompt}"
 
     twiml = MessagingResponse()
     msg = twiml.message(reply_text)
 
-    # Adjuntar audio si podemos generar TTS (WhatsApp/MMS acepta <Media>)
+    # Adjuntar audio si es WhatsApp y tenemos TTS
     v_id = bot_voice_id(bot)
-    if ELEVENLABS_API_KEY and v_id:
-        # Audio diciendo algo útil (eco del mensaje + mini saludo)
-        tts_text = f"{label} confirma: recibí tu mensaje: {body}."
+    if ELEVENLABS_API_KEY and v_id and is_whatsapp_num(to_number):
         from urllib.parse import urlencode, quote_plus
+        tts_text = f"{label} confirma: recibí tu mensaje: {body}."
         qs = urlencode({"text": tts_text, "voice_id": v_id}, quote_via=quote_plus)
         media_url = make_absolute_url(request, f"/tts?{qs}")
-        # Solo agregamos media en WhatsApp o MMS
-        if is_whatsapp_num(from_number):
-            msg.media(media_url)
+        msg.media(media_url)
 
     return Response(str(twiml), media_type="application/xml")
 
@@ -167,15 +185,15 @@ async def twilio_sms(request: Request) -> Response:
 @app.post("/twilio/voice")
 async def twilio_voice(request: Request) -> Response:
     form = await request.form()
-    from_number = str(form.get("From", "")).strip()
-    bot = find_bot_by_number(from_number)
+    # Enrutar por **To** (tu número en Twilio)
+    to_number = str(form.get("To", "")).strip()
+    bot = find_bot_by_number_to(to_number)
 
     display = bot["display_name"] if bot and bot.get("display_name") else "Agente"
     prompt = (bot.get("prompt") if bot else None) or "Hola, ¿en qué puedo ayudarte?"
     text = f"Hola, estás hablando con {display}. {prompt}"
 
     vr = VoiceResponse()
-
     v_id = bot_voice_id(bot)
     if ELEVENLABS_API_KEY and v_id:
         from urllib.parse import urlencode, quote_plus

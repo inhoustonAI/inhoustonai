@@ -1,27 +1,10 @@
 {
-  "voice": "marin",
-  "temperature": 0.8,
-  "model": "gpt-4o-realtime-preview-2024-12-17",
-
-  "languages": {
-    "allowed": ["es-US", "en-US"],          
-    "default": "es-US",                      
-    "auto_switch": true                      
+  "id": "sundin",
+  "display_name": "Sundin",
+  "phone_numbers": {
+    "voice": "+18326213202",           
+    "whatsapp": "whatsapp:+18325559876" 
   },
-
-  "system_prompt": "Cada vez que recibas una llamada debes iniciar: Hola soy sara, representante de ventas de in houston texas, ¿con quien tengo el gusto?. Luego del saludo, no lo repites mas y llamas a la persona por su nombre. Personalidad: jovial, natural y profesional; cálida, con chispa breve y orientada a conversión. Acento: español latino de EE. UU. con color mexicano-venezolano; NO uses voseo ni giros rioplatenses. En inglés usa US English estándar. No saludes por el nombre del cliente salvo que él lo diga. Barge-in: si el usuario interrumpe, te callas y cedes la palabra. No menciones temas médicos. No repitas el saludo inicial.",
-  
-
-  "realtime": {
-    "turn_detection": {
-      "type": "server_vad",
-      "threshold": 0.45,
-      "silence_duration_ms": 650,
-      "prefix_padding_ms": 160,
-      "create_response": true,
-      "interrupt_response": true
-    },
-    "input_audio_format": "g711_ulaw",
-    "output_audio_format": "g711_ulaw"
-  }
+  "elevenlabs": { "voice_id": "agent_8301k6n79bmvekcbx7vqby7asrze" },
+  "prompt": "Bienvenido a In Houston AI..."
 }
